@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.env
+.env.*
+outputs/
+runs/
+checkpoints/
+*.log
+*.xlsx
+!assets/tax-bureau-template-V260401.xlsx
+*.csv
+*.inspect.ndjson

@@ -1,0 +1,4 @@
+interface:
+  display_name: "千牛税局模板生成"
+  short_description: "按千牛申请日期关联订单商品与聚水潭票据，生成并校验税局模板表格"
+  default_prompt: "使用 $qianniu-invoice-issuance 按指定申请日期生成税局开票模板表格和异常清单。"
