@@ -1,7 +1,7 @@
 """Persistent Playwright browser controller for the Qianniu workflow.
 
 This module attaches to a native Edge/Chromium browser profile,
-reuses the three configured business pages, and exposes small, structured
+reuses the configured business pages, and exposes small, structured
 operations for the online coordinator.  Playwright is imported lazily so the
 local file-processing and unit-test paths do not require a browser package.
 
@@ -205,12 +205,7 @@ def load_browser_config(
     if not isinstance(data_dir, str) or not data_dir.strip():
         raise BrowserControllerError("浏览器配置缺少 user_data_dir", "configuration")
     sessions = value.get("browser_sessions")
-    if not isinstance(sessions, Mapping):
-        raise BrowserControllerError("浏览器配置缺少 browser_sessions", "configuration")
-    for role in ROLE_NAMES:
-        if role not in sessions:
-            raise BrowserControllerError(f"browser_sessions.{role} is required", "configuration")
-        _url_from_role(sessions[role], role)
+    role_specs(value)
 
     playwright = value.get("playwright")
     if playwright is None:
@@ -251,10 +246,15 @@ def load_browser_config(
 
 def role_specs(config: Mapping[str, Any]) -> dict[str, RoleSpec]:
     sessions = config.get("browser_sessions")
-    if not isinstance(sessions, Mapping):
-        raise BrowserControllerError("browser_sessions is required", "configuration")
+    if not isinstance(sessions, Mapping) or not sessions:
+        raise BrowserControllerError("browser_sessions 必须是非空角色对象", "configuration")
+    unknown = set(sessions) - set(ROLE_NAMES)
+    if unknown:
+        raise BrowserControllerError("browser_sessions 包含未知页面角色", "configuration")
     result: dict[str, RoleSpec] = {}
     for role in ROLE_NAMES:
+        if role not in sessions:
+            continue
         raw = sessions.get(role)
         url = _url_from_role(raw, role)
         patterns: tuple[str, ...] = ()
@@ -299,7 +299,8 @@ def _same_site_family(url: str, expected: str) -> bool:
 
 
 def _url_is_login(url: str) -> bool:
-    return bool(LOGIN_URL_RE.search(url or ""))
+    host = (urlsplit(url or "").hostname or "").lower()
+    return host in {"jstlogin.erp321.com", "loginmyseller.taobao.com"} or bool(LOGIN_URL_RE.search(url or ""))
 
 
 def _runtime_state_path(data_dir: Path, profile: str) -> Path:
@@ -629,6 +630,8 @@ class PlaywrightBrowserController:
                 browser_name = str(self.config.get("browser") or "Edge").lower()
                 args: list[str] = [
                     "--new-window",
+                    "--no-first-run",
+                    "--no-default-browser-check",
                     f"--user-data-dir={data_dir}",
                     "--remote-debugging-address=127.0.0.1",
                     f"--remote-debugging-port={debug_port}",
@@ -770,12 +773,16 @@ class PlaywrightBrowserController:
             # already-running native browser. Native process shutdown is an
             # explicit stop() operation, never ordinary task cleanup.
             if browser is not None:
-                await browser.close()
+                await asyncio.wait_for(browser.close(), timeout=5)
         finally:
-            await self._stop_playwright()
-            if self._profile_lock is not None:
-                self._profile_lock.release()
-                self._profile_lock = None
+            try:
+                await asyncio.wait_for(self._stop_playwright(), timeout=5)
+            finally:
+                # Even cancellation during runtime shutdown must release the
+                # OS lock; native browser processes remain untouched.
+                if self._profile_lock is not None:
+                    self._profile_lock.release()
+                    self._profile_lock = None
 
     async def stop(self) -> None:
         """Disconnect and stop only an Edge process started by this instance."""
@@ -988,8 +995,8 @@ class PlaywrightBrowserController:
             result["code"] = "context_missing"
         return result
 
-    async def check_logins(self, roles: Iterable[str] = ROLE_NAMES) -> dict[str, Any]:
-        results = [await self.check_login(role) for role in roles]
+    async def check_logins(self, roles: Iterable[str] | None = None) -> dict[str, Any]:
+        results = [await self.check_login(role) for role in (self.specs if roles is None else roles)]
         return {
             "ok": all(item["is_login"] for item in results),
             "roles": results,

@@ -53,6 +53,169 @@ class RunOnlineTests(unittest.TestCase):
         run_online.atomic_json(runner.input_dir / "capture_context.json", {"coid": "c", "uid": "u"})
         run_online.atomic_json(runner.input_dir / "goods_codes.json", {"codes": codes})
 
+    def split_configs(self, root):
+        qianniu = root / "qianniu-browser.json"
+        jst = root / "jst-browser.json"
+        qianniu.write_text(json.dumps({
+            "schema_version": 1, "browser": "Edge", "user_data_dir": str(root / "shop-data"),
+            "browser_sessions": {"invoice": "https://myseller.taobao.com/home.htm/merchant-invoice/",
+                                 "orders": "https://myseller.taobao.com/home.htm/trade-platform/tp/sold"},
+        }), encoding="utf-8")
+        jst.write_text(json.dumps({
+            "schema_version": 1, "browser": "Edge", "user_data_dir": str(root / "shared-data"),
+            "profile_directory": "Default", "remote_debugging_port": 19371,
+            "browser_sessions": {"goods": "https://fp.erp321.com/setting/goodsManage"},
+        }), encoding="utf-8")
+        return qianniu, jst
+
+    def test_split_browser_option_routes_to_adapter_and_preserves_single_default(self):
+        parser = run_online.build_parser()
+        self.assertIsNone(parser.parse_args([]).jst_browser_config)
+        self.assertEqual(parser.parse_args(["--jst-browser-config", "shared.json"]).jst_browser_config,
+                         Path("shared.json"))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            for shared in (None, jst):
+                with self.subTest(shared=shared), patch("playwright_adapter.PlaywrightAdapterRunner") as factory:
+                    runner = self.make_runner(root, browser_config=qianniu, jst_browser_config=shared)
+                    factory.assert_not_called()
+                    with run_online.ActiveLock(runner.output_root):
+                        runner._connect_browser()
+                    expected = {"progress": runner.progress}
+                    if shared is not None:
+                        expected["jst_config_path"] = jst.resolve()
+                    factory.assert_called_once_with(qianniu.resolve(), **expected)
+                    self.assertIs(runner.invoker.adapter_runner, factory.return_value)
+
+    def test_split_context_digest_binds_shared_browser_without_exposing_port(self):
+        from run_invoice import context_digest
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            fake = FakeAdapter()
+            runner = self.make_runner(root, fake, browser_config=qianniu, jst_browser_config=jst)
+            runner._context()
+            context = run_online.read_json(runner.input_dir / "capture_context.json")
+            self.assertEqual(context["context_sha256"], context_digest(context))
+            self.assertEqual(context["jst_browser_identity_sha256"], run_online.stable_sha256(runner.jst_browser_identity))
+            self.assertNotIn("19371", json.dumps(context))
+            self.assertEqual(runner.state["jst_browser_config_path"], str(jst.resolve()))
+            self.assertEqual(runner.state["jst_browser_config"]["remote_debugging_port"], 19371)
+            resumed = self.make_runner(root, fake, resume=runner.run_dir)
+            self.assertEqual(resumed.jst_browser_config_path, jst.resolve())
+            resumed._context()
+            self.assertEqual(fake.calls, [("qianniu", "context"), ("jst", "context")]*2)
+            single = self.make_runner(root, FakeAdapter())
+            single._context()
+            single_context = run_online.read_json(single.input_dir / "capture_context.json")
+            self.assertNotIn("jst_browser_identity_sha256", single_context)
+
+    def test_shared_browser_resume_accepts_equivalent_normalized_configuration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            runner = self.make_runner(root, FakeAdapter(), browser_config=qianniu, jst_browser_config=jst)
+            updated = run_online.read_json(jst)
+            updated["user_data_dir"] = "./shared-data"
+            updated["browser"] = "edge"
+            updated["playwright"] = {"profile_directory": updated.pop("profile_directory"),
+                                     "remote_debugging_port": str(updated.pop("remote_debugging_port"))}
+            updated["browser_sessions"]["goods"] = {"href": updated["browser_sessions"]["goods"]}
+            jst.write_text(json.dumps(updated), encoding="utf-8")
+            resumed = self.make_runner(root, FakeAdapter(), resume=runner.run_dir)
+            self.assertEqual(resumed.jst_browser_identity, runner.jst_browser_identity)
+
+    def test_shared_browser_resume_rejects_changed_environment_or_config_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            original = run_online.read_json(jst)
+            runner = self.make_runner(root, FakeAdapter(), browser_config=qianniu, jst_browser_config=jst)
+            before = (runner.run_dir / "run-state.json").read_bytes()
+            replacements = (("user_data_dir", str(root / "other-shared-data")),
+                            ("profile_directory", "Profile 2"), ("remote_debugging_port", 19372),
+                            ("browser_sessions", {"goods": "https://fp.erp321.com/other"}))
+            for key, value in replacements:
+                with self.subTest(key=key):
+                    jst.write_text(json.dumps({**original, key: value}), encoding="utf-8")
+                    with self.assertRaises(run_online.OnlineError) as error:
+                        self.make_runner(root, FakeAdapter(), resume=runner.run_dir)
+                    self.assertEqual(error.exception.code, "resume_mismatch")
+                    self.assertEqual(error.exception.site, "jst")
+            alternate = root / "copied-shared.json"
+            alternate.write_text(json.dumps(original), encoding="utf-8")
+            with self.assertRaises(run_online.OnlineError) as error:
+                self.make_runner(root, FakeAdapter(), resume=runner.run_dir, jst_browser_config=alternate)
+            self.assertEqual(error.exception.code, "resume_mismatch")
+            self.assertEqual(error.exception.site, "jst")
+            self.assertEqual((runner.run_dir / "run-state.json").read_bytes(), before)
+
+    def test_single_browser_resume_cannot_switch_to_shared_browser(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, jst = self.split_configs(root)
+            runner = self.make_runner(root, FakeAdapter())
+            with self.assertRaises(run_online.OnlineError) as error:
+                self.make_runner(root, FakeAdapter(), resume=runner.run_dir, jst_browser_config=jst)
+            self.assertEqual(error.exception.code, "resume_mismatch")
+            self.assertEqual(error.exception.site, "jst")
+
+    def test_browser_start_failure_keeps_site_and_redacts_configuration_from_report(self):
+        from playwright_adapter import PlaywrightAdapterError
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            failure = PlaywrightAdapterError("shared browser disconnected", "browser_disconnected", site="jst")
+            runner = self.make_runner(root, browser_config=qianniu, jst_browser_config=jst)
+            with patch("playwright_adapter.PlaywrightAdapterRunner", side_effect=failure):
+                with self.assertRaises(run_online.OnlineError) as error:
+                    runner.run()
+            self.assertEqual((error.exception.code, error.exception.site), ("browser_disconnected", "jst"))
+            report = run_online.read_json(runner.run_dir / "run.json")
+            self.assertEqual(report["error_site"], "jst")
+            self.assertNotIn("jst_browser_config", report)
+            self.assertNotIn("browser_config", report)
+            self.assertNotIn("19371", json.dumps(report))
+            self.assertEqual(run_online.read_json(runner.run_dir / "run-state.json")["error_site"], "jst")
+
+    def test_site_error_in_data_collection_is_recorded_for_queue_policy(self):
+        from playwright_adapter import PlaywrightAdapterError
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake = FakeAdapter()
+            def adapter(site, operation, input_path, output_path):
+                if site == "jst":
+                    raise PlaywrightAdapterError("login required", "auth_required", site="jst")
+                return fake(site, operation, input_path, output_path)
+            runner = self.make_runner(root, adapter)
+            with self.assertRaises(PlaywrightAdapterError):
+                runner.run()
+            self.assertEqual(runner.state["error_site"], "jst")
+            attempt = runner.state["stages"]["context"]["attempts"][-1]
+            self.assertEqual(attempt["error_site"], "jst")
+
+    def test_split_pages_are_merged_by_business_site(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            def adapter(site, operation, input_path, output_path):
+                if site == "qianniu":
+                    value = {"isLogin": True, "store": "店", "agentId": "test-agent",
+                             "browser_pages": {"invoice": "invoice-target", "orders": "orders-target"}}
+                else:
+                    value = {"isLogin": True, "issuer": "主体", "coid": "test-coid", "uid": "test-uid",
+                             "browser_pages": {"goods": "goods-target"}}
+                return {"payload": value}
+            runner = self.make_runner(root, adapter, browser_config=qianniu, jst_browser_config=jst)
+            runner._context()
+            expected = {"qianniu": {"invoice": "invoice-target", "orders": "orders-target"},
+                        "jst": {"goods": "goods-target"}}
+            self.assertEqual(runner.state["browser_pages"], expected)
+            resumed = self.make_runner(root, adapter, resume=runner.run_dir)
+            resumed._context()
+            self.assertEqual(resumed.state["browser_pages"], expected)
+
     def test_chunked_has_no_oversized_batch(self):
         batches = list(run_online.chunked([str(i) for i in range(101)], 50))
         self.assertEqual([50, 50, 1], [len(batch) for batch in batches])

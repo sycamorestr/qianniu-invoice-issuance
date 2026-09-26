@@ -232,6 +232,8 @@ class ControllerTests(unittest.TestCase):
                 result = asyncio.run(start_and_detach())
             launch.assert_called_once()
             args = launch.call_args.args[0]
+            self.assertIn("--no-first-run", args)
+            self.assertIn("--no-default-browser-check", args)
             self.assertFalse(any("extension" in arg for arg in args))
             for item in CONFIG["browser_sessions"].values():
                 self.assertEqual(args.count(item["url"]), 1)
@@ -298,6 +300,19 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(result["is_logged_in"])
         self.assertEqual(result["code"], "context_missing")
 
+    def test_current_site_login_hosts_stop_without_opening_more_tabs(self):
+        for role, url in (("goods", "https://jstlogin.erp321.com/"),
+                          ("invoice", "https://loginmyseller.taobao.com/")):
+            with self.subTest(role=role):
+                instance = controller.PlaywrightBrowserController(
+                    {**CONFIG, "browser_sessions": {role: CONFIG["browser_sessions"][role]}})
+                instance.context = FakeContext([FakePage(url)])
+                instance.context.new_page = AsyncMock()
+                with self.assertRaises(controller.BrowserControllerError) as error:
+                    asyncio.run(instance.connect(open_missing=True))
+                self.assertEqual(error.exception.code, "login_required")
+                instance.context.new_page.assert_not_awaited()
+
     def test_evaluate_file_preserves_iife_and_invokes_function_contract(self):
         instance = controller.PlaywrightBrowserController(CONFIG)
         page = FakePage(CONFIG["browser_sessions"]["goods"]["url"])
@@ -331,16 +346,42 @@ class ControllerTests(unittest.TestCase):
             self.assertTrue(loaded["user_data_dir"].endswith("profile"))
             self.assertTrue(loaded["download_dir"].replace("\\", "/").endswith("downloads/Profile 2"))
 
-    def test_config_rejects_missing_role(self):
+    def test_config_accepts_role_subsets_and_rejects_empty_or_unknown_roles(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "browser.json"
-            value = dict(CONFIG)
-            value["browser_sessions"] = dict(CONFIG["browser_sessions"])
-            value["browser_sessions"].pop("goods")
-            path.write_text(json.dumps(value), encoding="utf-8")
-            with self.assertRaises(controller.BrowserControllerError) as error:
-                controller.load_browser_config(path)
-            self.assertEqual(error.exception.code, "configuration")
+            for roles in (("invoice", "orders"), ("goods",), controller.ROLE_NAMES):
+                value = {**CONFIG, "browser_sessions": {role: CONFIG["browser_sessions"][role] for role in roles}}
+                path.write_text(json.dumps(value), encoding="utf-8")
+                loaded, _ = controller.load_browser_config(path)
+                self.assertEqual(set(controller.role_specs(loaded)), set(roles))
+            for sessions in ({}, {"unknown": "https://example.com"}):
+                path.write_text(json.dumps({**CONFIG, "browser_sessions": sessions}), encoding="utf-8")
+                with self.assertRaises(controller.BrowserControllerError) as error:
+                    controller.load_browser_config(path)
+                self.assertEqual(error.exception.code, "configuration")
+
+    def test_role_subsets_open_and_check_only_their_configured_pages(self):
+        for roles in (("invoice", "orders"), ("goods",)):
+            config = {**CONFIG, "browser_sessions": {role: CONFIG["browser_sessions"][role] for role in roles}}
+            instance = controller.PlaywrightBrowserController(config)
+            instance.context = FakeContext([])
+            result = asyncio.run(instance.connect(open_missing=True))
+            self.assertEqual(set(result["roles"]), set(roles))
+            self.assertEqual(len(instance.context.pages), len(roles))
+            self.assertEqual({page.url for page in instance.context.pages},
+                             {CONFIG["browser_sessions"][role]["url"] for role in roles})
+            checked = asyncio.run(instance.check_logins())
+            self.assertEqual({item["role"] for item in checked["roles"]}, set(roles))
+
+    def test_close_releases_profile_lock_even_when_runtime_shutdown_is_cancelled(self):
+        instance = controller.PlaywrightBrowserController(CONFIG)
+        lock = Mock()
+        instance._profile_lock = lock
+        instance._stop_playwright = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(instance.close())
+        lock.release.assert_called_once()
+        self.assertIsNone(instance._profile_lock)
 
     def test_role_matching_does_not_conflate_invoice_and_orders(self):
         self.assertTrue(controller._same_role_page(

@@ -42,9 +42,10 @@ SUPPORTED_BROWSER_CONFIG_SCHEMA = 1
 class OnlineError(RuntimeError):
     """A typed, user-actionable online workflow error."""
 
-    def __init__(self, message: str, code: str = "failed") -> None:
+    def __init__(self, message: str, code: str = "failed", *, site: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.site = site if site in {"qianniu", "jst"} else None
 
 
 def load_browser_config(config_path: Path | None = None) -> tuple[dict[str, Any], Path | None]:
@@ -99,6 +100,61 @@ def stable_sha256(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
                          separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def browser_identity(config: dict[str, Any], path: Path, roles: tuple[str, ...]) -> dict[str, Any]:
+    """Bind a shared browser's effective environment without exposing its port."""
+    config_path = path.expanduser().resolve()
+    settings = config.get("playwright") or {}
+    if not isinstance(settings, dict):
+        raise OnlineError("浏览器配置 playwright 必须是对象", "configuration", site="jst")
+    data_dir = Path(str(config.get("user_data_dir") or "")).expanduser()
+    if not data_dir.is_absolute():
+        data_dir = config_path.parent / data_dir
+    profile = str(config.get("profile_directory") or settings.get("profile_directory") or "Default").strip()
+    port = config.get("remote_debugging_port")
+    if port in (None, ""):
+        port = settings.get("remote_debugging_port", 9222)
+    try:
+        port = int(port)
+    except (TypeError, ValueError) as exc:
+        raise OnlineError("浏览器调试端口配置无效", "configuration", site="jst") from exc
+    if not 1 <= port <= 65535:
+        raise OnlineError("浏览器调试端口配置无效", "configuration", site="jst")
+    sessions = config.get("browser_sessions") or {}
+    role_identity = {}
+    for role in roles:
+        value = sessions.get(role)
+        if isinstance(value, str):
+            value = {"url": value.strip()}
+        elif isinstance(value, dict):
+            value = dict(value)
+            urls = value.get("urls")
+            value["url"] = str(value.get("url") or value.get("href") or
+                               (urls[0] if isinstance(urls, list) and urls else "")).strip()
+            value.pop("href", None)
+            value.pop("urls", None)
+        else:
+            raise OnlineError(f"浏览器配置缺少 browser_sessions.{role}", "configuration", site="jst")
+        if not value["url"]:
+            raise OnlineError(f"浏览器配置缺少 browser_sessions.{role} URL", "configuration", site="jst")
+        # The controller accepts these aliases as the same page evidence.
+        for target, aliases in (("login_positive_patterns", ("login_positive_patterns", "positive_url_patterns")),
+                                ("login_positive_selectors", ("login_positive_selectors", "positive_selectors"))):
+            selected = value.get(aliases[0]) or value.get(aliases[1]) or []
+            if isinstance(selected, str):
+                selected = [selected]
+            value[target] = list(selected)
+            value.pop(aliases[1], None)
+        role_identity[role] = value
+    endpoint = {"port": port,
+                "endpoint": config.get("cdp_endpoint") or config.get("endpoint") or
+                settings.get("cdp_endpoint") or settings.get("endpoint")}
+    return {"config_path": os.path.normcase(str(config_path)),
+            "browser": str(config.get("browser") or "").strip().lower(),
+            "user_data_dir": os.path.normcase(str(data_dir.resolve())),
+            "profile_directory": os.path.normcase(profile), "roles": role_identity,
+            "endpoint_sha256": stable_sha256(endpoint)}
 
 
 def request_sha256(payload: dict[str, Any]) -> str:
@@ -178,7 +234,7 @@ def validate_raw_payload(site: str, operation: str, value: Any,
         raise OnlineError("原始检查点不是业务数据（可能误用了回执文件）", "checkpoint_invalid")
     if value.get("blocked") is True:
         raise OnlineError(str(value.get("reason") or "页面采集被阻断"),
-                          str(value.get("reason") or "adapter_failed"))
+                          str(value.get("reason") or "adapter_failed"), site=site)
     if site == "jst" and operation == "query":
         rows = value.get("data")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -489,6 +545,7 @@ class OnlineRunner:
                  run_dir: Path | None = None, resume: Path | None = None,
                  replay_input: Path | None = None,
                  browser_config: Path | None = None,
+                 jst_browser_config: Path | None = None,
                  browser_backend: str | None = None,
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False,
@@ -513,6 +570,9 @@ class OnlineRunner:
         self._resume = resume.resolve() if resume else None
         self.browser_config: dict[str, Any] = {}
         self.browser_config_path: Path | None = None
+        self.jst_browser_config: dict[str, Any] = {}
+        self.jst_browser_config_path: Path | None = None
+        self.jst_browser_identity: dict[str, Any] | None = None
         if self._resume:
             self.run_dir = self._resume
             # Resume must reacquire the lock next to the original run, even
@@ -546,6 +606,20 @@ class OnlineRunner:
                                                   if isinstance(old.get("browser_config"), dict)
                                                   else {})
                 self.browser_config_path = config_path
+                saved_jst_path = old.get("jst_browser_config_path")
+                if jst_browser_config is not None and not saved_jst_path:
+                    raise OnlineError("恢复时不能改为独立票聚浏览器；请新建作业", "resume_mismatch", site="jst")
+                if saved_jst_path:
+                    selected_jst_path = Path(jst_browser_config or saved_jst_path).expanduser().resolve()
+                    if os.path.normcase(str(selected_jst_path)) != os.path.normcase(str(Path(saved_jst_path).expanduser().resolve())):
+                        raise OnlineError("恢复时共享票聚浏览器配置路径已变化", "resume_mismatch", site="jst")
+                    self._load_jst_browser(selected_jst_path)
+                    saved_jst_config = old.get("jst_browser_config")
+                    saved_identity = old.get("jst_browser_identity")
+                    if saved_identity is None and isinstance(saved_jst_config, dict):
+                        saved_identity = browser_identity(saved_jst_config, Path(saved_jst_path), ("goods",))
+                    if saved_identity != self.jst_browser_identity:
+                        raise OnlineError("恢复时共享票聚浏览器环境已变化", "resume_mismatch", site="jst")
             for key, value in (("date", date), ("store", store)):
                 if old.get(key) != value:
                     raise OnlineError(f"恢复参数与原运行不一致: {key}", "resume_mismatch")
@@ -575,6 +649,8 @@ class OnlineRunner:
             self.state = self._new_state("replay")
         else:
             self.browser_config, self.browser_config_path = load_browser_config(browser_config)
+            if jst_browser_config is not None:
+                self._load_jst_browser(jst_browser_config)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             store_key = hashlib.sha256(store.encode("utf-8")).hexdigest()[:10]
             self.run_dir = (Path(run_dir).resolve() if run_dir else self.output_root / f"online-{store_key}-{date}-{stamp}")
@@ -587,6 +663,10 @@ class OnlineRunner:
             self.state["browser_config"] = self.browser_config
         if self.browser_config_path:
             self.state["browser_config_path"] = str(self.browser_config_path)
+        if self.jst_browser_config_path:
+            self.state["jst_browser_config_path"] = str(self.jst_browser_config_path)
+            self.state["jst_browser_config"] = self.jst_browser_config
+            self.state["jst_browser_identity"] = self.jst_browser_identity
         self.state["browser_backend"] = self.browser_backend
         self.state.update({"node": self.node, "node_modules": self.node_modules})
         if not self._resume:
@@ -598,17 +678,31 @@ class OnlineRunner:
         if self._resume:
             self._validate_input_hashes()
 
+    def _load_jst_browser(self, path: Path) -> None:
+        try:
+            config, selected_path = load_browser_config(path)
+            assert selected_path is not None
+            identity = browser_identity(config, selected_path, ("goods",))
+        except OnlineError as exc:
+            raise OnlineError(str(exc), exc.code, site="jst") from exc
+        self.jst_browser_config = config
+        self.jst_browser_config_path = selected_path
+        self.jst_browser_identity = identity
+
     def _connect_browser(self) -> None:
         """Called only with the job lock held, before any live page work."""
         if self._needs_browser and self._browser_runner is None:
             try:
                 from playwright_adapter import PlaywrightAdapterRunner
+                options = {"progress": self.progress}
+                if self.jst_browser_config_path is not None:
+                    options["jst_config_path"] = self.jst_browser_config_path
                 self._browser_runner = PlaywrightAdapterRunner(
-                    self.browser_config_path, progress=self.progress
+                    self.browser_config_path, **options
                 )
             except Exception as exc:
                 code = getattr(exc, "code", "dependency_missing")
-                raise OnlineError(str(exc), code) from exc
+                raise OnlineError(str(exc), code, site=getattr(exc, "site", None)) from exc
             self.invoker.adapter_runner = self._browser_runner
 
     def _new_state(self, mode: str) -> dict[str, Any]:
@@ -785,12 +879,12 @@ class OnlineRunner:
     def _verified_identity(context: dict[str, Any], site: str, expected: str) -> str:
         label = "千牛" if site == "qianniu" else "票聚"
         if context.get("isLogin") is False:
-            raise OnlineError(f"{label}登录态失效，请人工介入", "auth_required")
+            raise OnlineError(f"{label}登录态失效，请人工介入", "auth_required", site=site)
         if context.get("isLogin") is not True:
-            raise OnlineError(f"{label}缺少登录态正向证据", "context_missing")
+            raise OnlineError(f"{label}缺少登录态正向证据", "context_missing", site=site)
         fields = ("store", "agentId") if site == "qianniu" else ("issuer", "coid", "uid")
         if any(context.get(field) in (None, "") for field in fields):
-            raise OnlineError(f"{label}主体上下文字段缺失", "context_missing")
+            raise OnlineError(f"{label}主体上下文字段缺失", "context_missing", site=site)
         observed = str(context[fields[0]])
         # The operator's UI label is accepted only when it was actually
         # observed alongside the canonical company field, never regex-guessed.
@@ -798,7 +892,7 @@ class OnlineRunner:
         if site == "jst" and context.get("issuer_label"):
             permitted.add(str(context["issuer_label"]))
         if expected not in permitted:
-            raise OnlineError(f"{label}主体不匹配: 预期 {expected}，当前 {observed}", "context_mismatch")
+            raise OnlineError(f"{label}主体不匹配: 预期 {expected}，当前 {observed}", "context_mismatch", site=site)
         return observed
 
     def _refresh_context(self, *, allow_partial: bool = False) -> None:
@@ -823,6 +917,11 @@ class OnlineRunner:
                     saved.update({field: previous[field] for field in fields if field in previous})
         else:
             raise OnlineError("恢复上下文缺少原主体证据", "checkpoint_invalid")
+        saved_jst_identity = saved.get("jst_browser_identity_sha256")
+        if saved_jst_identity is not None and (
+                self.jst_browser_identity is None or
+                saved_jst_identity != stable_sha256(self.jst_browser_identity)):
+            raise OnlineError("恢复时票聚浏览器与原采集环境不一致", "resume_mismatch", site="jst")
         suffix = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         outputs = []
         for site, operation, names in (("qianniu", "context", ("store", "agentId")),
@@ -841,7 +940,7 @@ class OnlineRunner:
                                         saved.get("issuer_company", saved.get("issuer")))
             except OnlineError as exc:
                 if exc.code == "context_mismatch":
-                    raise OnlineError(str(exc), "context_changed") from exc
+                    raise OnlineError(str(exc), "context_changed", site=site) from exc
                 raise
             for name in names:
                 if name not in saved:
@@ -855,7 +954,7 @@ class OnlineRunner:
                     observed = current.get(name)
                     expected = saved.get(name)
                 if str(observed) != str(expected):
-                    raise OnlineError(f"恢复时页面主体变化: {name}", "context_changed")
+                    raise OnlineError(f"恢复时页面主体变化: {name}", "context_changed", site=site)
             if current.get("browser_pages"):
                 self.state.setdefault("browser_pages", {})[site] = current["browser_pages"]
         self.stage_done("context_refresh", outputs)
@@ -901,6 +1000,8 @@ class OnlineRunner:
                    "jst_url": pctx.get("jst_url") or
                    "https://fp.erp321.com/setting/goodsManage", "agentId": str(qctx["agentId"]),
                    "coid": str(pctx["coid"]), "uid": str(pctx["uid"])}
+        if self.jst_browser_identity is not None:
+            context["jst_browser_identity_sha256"] = stable_sha256(self.jst_browser_identity)
         context["context_sha256"] = stable_sha256(context)
         atomic_json(self.input_dir / "capture_context.json", context)
         self.stage_done("context", [qpath, ppath, self.input_dir / "capture_context.json"],
@@ -1053,7 +1154,7 @@ class OnlineRunner:
             failed = [row.get("input_goods_code") for row in merged.get("data", [])
                       if row.get("reason") == "request_failed"]
             if failed:
-                raise OnlineError("票聚请求未完成，可恢复后只补失败编码: " + ",".join(failed), "request_failed")
+                raise OnlineError("票聚请求未完成，可恢复后只补失败编码: " + ",".join(failed), "request_failed", site="jst")
             self.stage_done("jst", [*parts, self.input_dir / "jst_query.json"],
                             codes_sha256=file_sha256(codes_path))
 
@@ -1296,6 +1397,8 @@ class OnlineRunner:
                 generated_manifest = read_json(self.generated_dir / "run.json")
                 self.state.update({"status": "complete", "finished_at": utc_now(),
                                    "result_status": generated_manifest.get("status")})
+                for key in ("error", "error_code", "error_site"):
+                    self.state.pop(key, None)
                 self._write_state()
                 result = {"status": generated_manifest.get("status", "complete"),
                           "run_dir": str(self.run_dir), "generated_dir": str(self.generated_dir),
@@ -1307,12 +1410,16 @@ class OnlineRunner:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return result
             except Exception as exc:
+                error_site = getattr(exc, "site", None)
+                if error_site not in {"qianniu", "jst"}:
+                    error_site = None
                 for name, record in self.state.get("stages", {}).items():
                     if record.get("status") == "running":
                         self._finish_attempt(name, "failed", error=str(exc),
-                                             error_code=getattr(exc, "code", "failed"))
+                                             error_code=getattr(exc, "code", "failed"), error_site=error_site)
                 self.state.update({"status": "failed", "finished_at": utc_now(),
-                                   "error": str(exc), "error_code": getattr(exc, "code", "failed")})
+                                   "error": str(exc), "error_code": getattr(exc, "code", "failed"),
+                                   "error_site": error_site})
                 try:
                     self._validate_input_hashes(check=False)
                 except Exception as hash_exc:
@@ -1331,6 +1438,10 @@ class OnlineRunner:
 
     def _publish_run_report(self, report: dict[str, Any]) -> None:
         """Keep latest status consistent while retaining each failed attempt."""
+        # Runtime configuration stays in the local recovery state. Reports
+        # expose only the environment identity, never a debugging endpoint.
+        report = {key: value for key, value in report.items()
+                  if key not in {"browser_config", "jst_browser_config"}}
         destination = self.run_dir / "run.json"
         if destination.is_file():
             previous = read_json(destination)
@@ -1358,6 +1469,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replay-input", type=Path)
     parser.add_argument("--browser-config", type=Path,
                         help=f"浏览器配置 JSON；未传时读取 {QIANNIU_BROWSER_CONFIG_ENV}")
+    parser.add_argument("--jst-browser-config", type=Path,
+                        help="可选的共享票聚浏览器配置；省略时使用同一浏览器的 goods 页")
     parser.add_argument("--browser-backend", choices=("playwright",),
                         default="playwright",
                         help="兼容参数；唯一浏览器后端为 Playwright")
@@ -1395,6 +1508,7 @@ def main(argv: list[str] | None = None) -> int:
         runner = OnlineRunner(date=date, store=store, issuer=issuer, agent_id=agent_id, output_root=args.output_root,
                               run_dir=args.run_dir, resume=args.resume, replay_input=args.replay_input,
                               browser_config=args.browser_config, browser_backend=args.browser_backend,
+                              jst_browser_config=args.jst_browser_config,
                               node=args.node,
                               node_modules=args.node_modules,
                               plan_only=args.plan_only)

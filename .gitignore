@@ -9,6 +9,11 @@ browser-config.json
 browser-config.*.json
 !assets/browser-config.example.json
 config/
+profiles/
+shops.json
+shops.*.json
+!assets/shops.example.json
+shop-input.json
 data/
 downloads/
 *.runtime.json

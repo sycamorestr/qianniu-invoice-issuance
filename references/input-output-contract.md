@@ -3,7 +3,8 @@
 ## 代码边界
 
 ```text
-run_online.py：锁、阶段、采集检查点、恢复、最终报告
+run_batch.py（多店可选）：串行调度、完成文件校验、失败分类、批次汇总
+  → run_online.py：单店锁、阶段、采集检查点、恢复、最终报告
   → playwright_adapter.py：一个后台事件循环，分发到固定页面
     → playwright_controller.py：连接 Edge、页面角色、执行 JS
       → 页面接口 / 必要订单详情
@@ -19,6 +20,8 @@ run_online.py：锁、阶段、采集检查点、恢复、最终报告
 
 新任务必须提供日期、店铺、票聚主体和浏览器配置。配置也可通过 `QIANNIU_BROWSER_CONFIG` 指定。`--run-dir` 可指定尚不存在的新作业目录，默认目录由店铺标识、日期和微秒时间组成。
 
+`--jst-browser-config <配置>` 可指定独立共享票聚浏览器，此时千牛配置只含 `invoice/orders`，票聚配置只含 `goods`。省略时保持原有单浏览器三角色模式。多店入口 `run_batch.py --registry <shops.json> --date YYYY-MM-DD` 在同一 issuer 下串行调用单店入口；`--shops` 限定店铺 id，`--resume` 恢复批次。完整契约见[多店配置与运行](multi-shop.md)。
+
 ```powershell
 & $python "$skill/scripts/run_online.py" `
   --date 'YYYY-MM-DD' --store '本次店铺' --issuer '本次公司' `
@@ -26,7 +29,7 @@ run_online.py：锁、阶段、采集检查点、恢复、最终报告
   --node $node --node-modules $nodeModules
 ```
 
-`--resume <作业目录>` 恢复原任务；日期、店铺、主体、浏览器数据目录及 Profile 不可改变。`--replay-input <输入目录>` 不连接浏览器，结果标为离线。`--plan-only` 输出计划、异常和原件副本，不写税局 XLSX。
+`--resume <作业目录>` 恢复原任务；日期、店铺、主体、浏览器数据目录及 Profile 不可改变。双浏览器任务还绑定共享票聚配置路径和环境身份；不能在恢复中改为另一浏览器或临时增加共享配置。`--replay-input <输入目录>` 不连接浏览器，结果标为离线。`--plan-only` 输出计划、异常和原件副本，不写税局 XLSX。
 
 ### 运行环境选择
 
@@ -73,7 +76,7 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 ## 原子发布和恢复
 
-先获取输出目录作业锁，再连接浏览器并获取整个 `user_data_dir` 的文件锁。锁由操作系统持有句柄，进程退出自动释放；锁文件存在不等于被占用，不能删除文件解锁。
+先获取输出目录作业锁，再连接浏览器并获取整个 `user_data_dir` 的文件锁。双浏览器按规范化数据目录排序连接，共享票聚锁一直持有到本店任务结束。锁由操作系统持有句柄，进程退出自动释放；锁文件存在不等于被占用，不能删除文件解锁。
 
 成功业务检查点不可覆盖。采集响应完成后，`publications/<批次>.json` 保存响应字节、请求及输出哈希和回执，数据与 `receipts/<批次>.json` 随后提交。若本地发布失败，恢复仅凭完整且身份匹配的事务补发布，不再次发出已保存成功响应的业务请求。没有完整事务证据的残片返回 `checkpoint_invalid`，不能把 `.partial` 当成功文件。
 
@@ -107,6 +110,8 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 根 `run.json` 发布最新终态；`attempts/` 保留历史失败；生成目录的 `run.json` 记录文件级结果。`progress.log` 追加进度，阶段 attempts 保存开始/结束时间、类型、状态和耗时；本地重合并不等于接口失败重试。
 
 成功交付原件副本、税局模板、异常清单和报告。无可生成申请时不发布可导入税局模板；若采集失败，保留已取得的原件和检查点。数据/结构校验不等于视觉或税局上传通过。
+
+多店增加 `batch-state.json`、`batch-summary.json`、`batch-summary.csv`，每店产物保持独立。批次恢复在任何新浏览器请求前校验全部已完成店铺的输入/输出哈希，通过后跳过，不重新采集这些店铺；未完成店铺沿用各自的单店恢复。共享票聚、未知或未明确归类的错误停止批次，只有标为 qianniu 的明确单店环境/认证错误可记录后继续。批次状态与详情见[多店配置与运行](multi-shop.md#状态恢复与交付)。
 
 在仓库根目录运行离线检查：
 

@@ -11,11 +11,13 @@
 | `goods` | `https://fp.erp321.com/setting/goodsManage` |
 | 票聚商品 iframe | `https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index` |
 
-`playwright_adapter.py` 在一个后台事件循环中复用控制器。日常 `connect(open_missing=True)` 连接已经运行的专用 Edge，先复用页面，再按配置 URL 补齐缺页一次；不会启动浏览器进程。生命周期和故障边界见[浏览器控制](playwright-browser.md)。
+`playwright_adapter.py` 在一个后台事件循环中复用控制器。三个角色既可在同一浏览器，也可分为千牛 `invoice/orders` 与共享票聚 `goods` 两个浏览器；脚本依据 site 进入对应页面上下文。日常 `connect(open_missing=True)` 连接已经运行的专用 Edge，先复用页面，再仅按各自配置的角色 URL 补齐缺页一次，不误开另一站；不会启动浏览器进程。生命周期和故障边界见[浏览器控制](playwright-browser.md)。
 
 `playwright_context_qianniu.js` 通过 `/api/context`、`/api/shops` 核对当前千牛登录与店铺。票聚外层页面提供公司显示名称，`playwright_context_jst.js` 从当前商品 iframe 资源记录提取 `coid`、`uid`。公司名和带操作员的标签分别保存，`agentId` 取当前页面运行时或已核对的主体接口值。页面存在、URL 无 login 均不能代替身份核验。
 
 控制器在对应 `Page` 或 `Frame` 执行本地 JS。请求使用 `credentials: "include"` 复用浏览器会话，不导出 Cookie、令牌、完整请求头或 HAR。浏览器页面不需要切到前台。
+
+多店共用票聚只共享其登录会话，不合并各店的订单或申请数据。每店开始都正向核验本店千牛和同一个票聚 issuer；采集结果写入各自作业目录。异常保留 `site=qianniu/jst`，使批次能够区分单店问题与共享故障；接口业务规则保持一致。
 
 ## 千牛申请诊断
 
