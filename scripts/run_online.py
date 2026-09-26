@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 
 HERE = Path(__file__).resolve().parent
@@ -78,10 +78,16 @@ def load_browser_config(config_path: Path | None = None) -> tuple[dict[str, Any]
     if sessions is not None:
         if not isinstance(sessions, dict):
             raise OnlineError("浏览器配置 browser_sessions 必须是对象", "configuration")
-        unknown = sorted(set(sessions) - {"invoice", "orders", "goods"})
+        unknown = sorted(set(sessions) - {"home", "invoice", "orders", "goods"})
         if unknown:
             raise OnlineError(f"浏览器配置含未知 browser_sessions: {', '.join(unknown)}", "configuration")
-    return dict(value), path
+    if 'home' not in (sessions or {}):
+        return dict(value), path
+    from invoice_browser_config import with_invoice_pages
+    try:
+        return with_invoice_pages(value), path
+    except ValueError as exc:
+        raise OnlineError(str(exc), "configuration") from exc
 
 
 def utc_now() -> str:
@@ -542,6 +548,7 @@ class OnlineRunner:
 
     def __init__(self, *, date: str, store: str, issuer: str, output_root: Path,
                  agent_id: str | None = None,
+                 expected_account: str | None = None,
                  run_dir: Path | None = None, resume: Path | None = None,
                  replay_input: Path | None = None,
                  browser_config: Path | None = None,
@@ -549,6 +556,7 @@ class OnlineRunner:
                  browser_backend: str | None = None,
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False,
+                 connect_only: bool = False,
                  adapter_runner: Callable[[str, str, Path, Path], Any] | None = None) -> None:
         if resume and replay_input:
             raise OnlineError("--resume 与 --replay-input 不能同时使用", "configuration")
@@ -556,11 +564,15 @@ class OnlineRunner:
         self.store = store
         self.issuer = issuer
         self.agent_id = str(agent_id) if agent_id not in (None, "") else None
+        if expected_account is not None and not isinstance(expected_account, str):
+            raise OnlineError("expected_account 必须是完整登录用户名", "configuration", site="qianniu")
+        self.expected_account = expected_account.strip() or None if expected_account is not None else None
         self.requested_issuer = issuer
         self._stage_started: dict[str, float] = {}
         self.output_root = Path(output_root).resolve()
         self.replay = replay_input is not None
         self.plan_only = plan_only
+        self.connect_only = connect_only
         self.node = node
         self.node_modules = node_modules
         self.browser_backend = str(browser_backend or "playwright").strip().lower()
@@ -637,6 +649,22 @@ class OnlineRunner:
             if self.agent_id is not None and self.agent_id != old.get("agent_id"):
                 raise OnlineError("恢复参数与原运行不一致: agent_id", "resume_mismatch")
             self.agent_id = self.agent_id or old.get("agent_id")
+            saved_account = old.get("expected_account") or None
+            if self.expected_account is not None and self.expected_account != saved_account:
+                # A legacy failed run can acquire its first explicit account
+                # only before any Qianniu context response was committed.
+                # A saved publication journal counts even if publishing its
+                # raw context file was interrupted.
+                context_committed = any(path.exists() for path in (
+                    self.input_dir / "context_qianniu.json",
+                    self.input_dir / "capture_context.json",
+                    self.run_dir / "receipts" / "context-qianniu.json",
+                    self.run_dir / "publications" / "context-qianniu.json",
+                    self.run_dir / "publications" / "context-qianniu.json.partial",
+                )) or bool(old.get("checkpoints", {}).get("context-qianniu"))
+                if saved_account is not None or context_committed:
+                    raise OnlineError("恢复参数与原运行不一致: expected_account", "resume_mismatch", site="qianniu")
+            self.expected_account = self.expected_account or saved_account
         elif replay_input:
             source = Path(replay_input).resolve()
             if not source.is_dir():
@@ -668,6 +696,7 @@ class OnlineRunner:
             self.state["jst_browser_config"] = self.jst_browser_config
             self.state["jst_browser_identity"] = self.jst_browser_identity
         self.state["browser_backend"] = self.browser_backend
+        self.state["expected_account"] = self.expected_account
         self.state.update({"node": self.node, "node_modules": self.node_modules})
         if not self._resume:
             self._write_state()
@@ -695,6 +724,8 @@ class OnlineRunner:
             try:
                 from playwright_adapter import PlaywrightAdapterRunner
                 options = {"progress": self.progress}
+                if self.connect_only:
+                    options["launch_if_needed"] = False
                 if self.jst_browser_config_path is not None:
                     options["jst_config_path"] = self.jst_browser_config_path
                 self._browser_runner = PlaywrightAdapterRunner(
@@ -708,6 +739,7 @@ class OnlineRunner:
     def _new_state(self, mode: str) -> dict[str, Any]:
         return {"version": 1, "mode": mode, "date": self.date, "store": self.store,
                 "agent_id": self.agent_id,
+                "expected_account": self.expected_account,
                 "plan_only": self.plan_only,
                 "issuer": self.issuer, "requested_issuer": self.requested_issuer,
                 "run_dir": str(self.run_dir),
@@ -828,6 +860,10 @@ class OnlineRunner:
         request = {"date": self.date, "expected_store": self.store,
                    "expected_issuer": self.issuer,
                    "rebind_if_missing": True, **payload}
+        if site == "qianniu" and operation == "context" and self.expected_account is not None:
+            # Keep all non-context request identities unchanged so successful
+            # export/order checkpoints remain reusable by older jobs.
+            request["expected_account"] = self.expected_account
         if pages:
             request["browser_pages"] = pages
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
@@ -907,7 +943,7 @@ class OnlineRunner:
             # for a fresh check of both currently logged-in sites on resume.
             saved = {"store": self.store, "issuer": self.issuer}
             for site, filename, fields, expected in (
-                ("qianniu", "context_qianniu.json", ("store", "agentId"), self.store),
+                ("qianniu", "context_qianniu.json", ("store", "agentId", "observed_store", "account_nick"), self.store),
                 ("jst", "context_piaoju.json", ("issuer", "issuer_label", "coid", "uid"), self.issuer),
             ):
                 path = self.input_dir / filename
@@ -924,7 +960,7 @@ class OnlineRunner:
             raise OnlineError("恢复时票聚浏览器与原采集环境不一致", "resume_mismatch", site="jst")
         suffix = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         outputs = []
-        for site, operation, names in (("qianniu", "context", ("store", "agentId")),
+        for site, operation, names in (("qianniu", "context", ("store", "agentId", "observed_store", "account_nick")),
                                        ("jst", "context", ("issuer", "coid", "uid"))):
             path = self.run_dir / f"resume-context-{site}-{suffix}.json"
             request = {"issuer": self.issuer, "expected_issuer": self.issuer} if site == "jst" else {
@@ -932,6 +968,10 @@ class OnlineRunner:
             }
             if site == "qianniu" and saved.get("agentId"):
                 request["agent_id"] = saved["agentId"]
+            if site == "qianniu":
+                for name in ("observed_store", "account_nick"):
+                    if saved.get(name) is not None:
+                        request["expected_" + name] = saved[name]
             self.collect(site, operation, request, path, f"resume-{site}-{suffix}")
             outputs.append(path)
             current = read_json(path)
@@ -1000,6 +1040,9 @@ class OnlineRunner:
                    "jst_url": pctx.get("jst_url") or
                    "https://fp.erp321.com/setting/goodsManage", "agentId": str(qctx["agentId"]),
                    "coid": str(pctx["coid"]), "uid": str(pctx["uid"])}
+        for name in ("observed_store", "account_nick"):
+            if qctx.get(name) is not None:
+                context[name] = qctx[name]
         if self.jst_browser_identity is not None:
             context["jst_browser_identity_sha256"] = stable_sha256(self.jst_browser_identity)
         context["context_sha256"] = stable_sha256(context)
@@ -1022,18 +1065,86 @@ class OnlineRunner:
             self.stage_done("applications", [path])
         if not self.stage_is_done("export"):
             self.stage_start("export")
-            path = self.input_dir / "qianniu_common.xlsx"
+            template = self.input_dir / "qianniu_common.xlsx"
+            path = self.input_dir / "common-export.bin"
+            # Old runs captured directly to XLSX. Preserve that immutable
+            # receipt identity, including interrupted local publication.
+            saved_receipt = self.state.get("checkpoints", {}).get("export")
+            for candidate in (self.run_dir / "receipts" / "export.json",
+                              self.run_dir / "publications" / "export.json",
+                              self.run_dir / "publications" / "export.json.partial"):
+                if saved_receipt or not candidate.is_file():
+                    continue
+                saved = read_json(candidate)
+                saved_receipt = saved.get("receipt", saved)
+            if saved_receipt:
+                saved_path = Path(saved_receipt.get("outputPath", "")).resolve()
+                if saved_path not in {path.resolve(), template.resolve()}:
+                    raise OnlineError("通用模板导出检查点路径无效", "resume_mismatch")
+                path = saved_path
+            elif template.exists():
+                path = template
             self.collect("qianniu", "export", {
                     "date": self.date, "agentId": context["agentId"],
                     "expected_store": self.store, "expected_issuer": self.issuer,
                 }, path, "export", binary=True)
+            if path.stat().st_size == 0:
+                if path == template or template.exists() or not self._applications_are_empty():
+                    raise OnlineError("导出为空但申请列表未证实无数据，已保留原始响应", "empty_export_unverified")
+                self.stage_done("export", [path], empty_export=True)
+                return
             try:
                 with ZipFile(path) as archive:
                     if archive.testzip() is not None:
                         raise OnlineError("通用模板 ZIP 校验失败", "checkpoint_invalid")
-            except OSError as exc:
+            except (OSError, BadZipFile) as exc:
                 raise OnlineError(f"通用模板不是有效 XLSX: {exc}", "checkpoint_invalid") from exc
-            self.stage_done("export", [path])
+            if path != template:
+                self.invoker._commit_saved_bytes(template, path.read_bytes())
+            self.stage_done("export", list(dict.fromkeys((path, template))), empty_export=False)
+
+    def _applications_are_empty(self) -> bool:
+        """Require complete, explicit list evidence, never just a missing row."""
+        if not self.stage_is_done("applications"):
+            return False
+        data = read_json(self.input_dir / "applications.json")
+        return (data.get("date") == self.date and data.get("rows") == []
+                and all(type(data.get(key)) in (int, float) and data[key] == 0
+                        for key in ("total", "api_total", "observed_total")))
+
+    def _empty_export_evidence(self) -> dict[str, str] | None:
+        record = self.state.get("stages", {}).get("export", {})
+        if not record.get("empty_export") or not self.stage_is_done("export"):
+            return None
+        path = self.input_dir / "common-export.bin"
+        if (not path.is_file() or path.stat().st_size != 0
+                or (self.input_dir / "qianniu_common.xlsx").exists()
+                or not self._applications_are_empty()):
+            raise OnlineError("零数据导出的原始证据不一致", "resume_mismatch")
+        return {"path": str(path.resolve()), "sha256": file_sha256(path),
+                "reason": "applications_and_export_empty"}
+
+    def _generate_no_applications(self, evidence: dict[str, str]) -> None:
+        """Publish a verifiable zero result without manufacturing a workbook."""
+        self.generated_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "date": self.date, "store": self.store, "issuer": self.issuer,
+            "started_at": self.state["started_at"], "stage": "verified",
+            "status": "no_applications", "replay": self.replay,
+            "selected_count": 0, "ready_count": 0, "blocked_count": 0,
+            "excluded_count": 0, "ready_amount": "0.00", "blocked_amount": "0.00",
+            "excluded_amount": "0.00", "excluded_application_ids": [], "detail_rows": 0,
+            "output": None, "common_template_output": None, "empty_export": evidence,
+            "inputs": {name: {"path": str((self.input_dir / name).resolve()),
+                              "sha256": file_sha256(self.input_dir / name)}
+                       for name in ("capture_context.json", "applications.json", "common-export.bin")},
+        }
+        # Identical bytes also recover a crash after local publication but
+        # before the generate stage was committed, without another export.
+        self.invoker._commit_saved_bytes(self.generated_dir / "exceptions.csv",
+                                        "申请流水号,金额,暂缓原因\r\n".encode("utf-8-sig"))
+        self.invoker._commit_saved_bytes(self.generated_dir / "run.json",
+                                        (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
     def _orders(self, force: bool = False) -> None:
         if self.stage_is_done("orders") and not force:
@@ -1359,7 +1470,7 @@ class OnlineRunner:
                 if not receipt_path.is_file() or read_json(receipt_path) != item:
                     raise OnlineError(f"适配器回执已变化: {receipt_path}", "resume_mismatch")
         hashes = []
-        for name in ("capture_context.json", "applications.json", "qianniu_common.xlsx",
+        for name in ("capture_context.json", "applications.json", "qianniu_common.xlsx", "common-export.bin",
                      "selection.json", "order_ids.json", "order_batches.json", "old_details.json",
                      "supplemental_details.json", "match_evidence.json", "parts_manifest.json",
                      "goods_codes.json", "jst_query.json"):
@@ -1377,21 +1488,28 @@ class OnlineRunner:
                     }
                 self._write_state()
                 self._connect_browser()
+                empty_export = None
                 if self.replay:
                     self.progress("replay-input: offline only")
                 else:
                     self._context()
                     self._applications_export()
-                    self._orders()
-                    self._jst()
-                    self._probe_and_details()
+                    empty_export = self._empty_export_evidence()
+                    if empty_export is None:
+                        self._orders()
+                        self._jst()
+                        self._probe_and_details()
                 if not self.stage_is_done("generate"):
                     self.stage_start("generate")
-                    self._run_invoice(self.generated_dir, plan_only=self.plan_only)
-                    outputs = [self.generated_dir / "run.json", self.generated_dir / f"qianniu_common_{self.date}.xlsx"]
-                    final = self.generated_dir / f"qianniu_invoice_tax_template_{self.date}.xlsx"
-                    if final.exists():
-                        outputs.append(final)
+                    if empty_export is not None:
+                        self._generate_no_applications(empty_export)
+                    else:
+                        self._run_invoice(self.generated_dir, plan_only=self.plan_only)
+                    outputs = [path for path in (
+                        self.generated_dir / "run.json", self.generated_dir / "exceptions.csv",
+                        self.generated_dir / f"qianniu_common_{self.date}.xlsx",
+                        self.generated_dir / f"qianniu_invoice_tax_template_{self.date}.xlsx",
+                    ) if path.is_file()]
                     self.stage_done("generate", outputs)
                 self._validate_input_hashes(check=False)
                 generated_manifest = read_json(self.generated_dir / "run.json")
@@ -1463,6 +1581,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--issuer", required=False)
     parser.add_argument("--agent-id", required=False,
                         help="可选；当千牛页面不暴露 agentId 时传入当前接口已核对的值")
+    parser.add_argument("--expected-account", required=False,
+                        help="可选；配置中完整的千牛登录用户名，用于严格核验当前账号，不是密码")
     parser.add_argument("--output-root", type=Path, default=Path("outputs"))
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -1477,6 +1597,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--node", help="explicit Node executable for workbook rendering")
     parser.add_argument("--node-modules")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--connect-only", action="store_true",
+                        help="仅连接已运行浏览器；默认按需启动原有独立环境并复用本机登录态")
     return parser
 
 
@@ -1505,13 +1627,14 @@ def main(argv: list[str] | None = None) -> int:
             date, store, issuer, agent_id = args.date, args.store, args.issuer, args.agent_id
         if not date or not store or not issuer:
             raise OnlineError("--date、--store、--issuer 为必填参数（--resume/--replay-input 可从快照推断）", "configuration")
-        runner = OnlineRunner(date=date, store=store, issuer=issuer, agent_id=agent_id, output_root=args.output_root,
+        runner = OnlineRunner(date=date, store=store, issuer=issuer, agent_id=agent_id,
+                              expected_account=args.expected_account, output_root=args.output_root,
                               run_dir=args.run_dir, resume=args.resume, replay_input=args.replay_input,
                               browser_config=args.browser_config, browser_backend=args.browser_backend,
                               jst_browser_config=args.jst_browser_config,
                               node=args.node,
                               node_modules=args.node_modules,
-                              plan_only=args.plan_only)
+                              plan_only=args.plan_only, connect_only=args.connect_only)
         try:
             runner.run()
         finally:

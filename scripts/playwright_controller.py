@@ -31,7 +31,7 @@ from urllib.request import Request, urlopen
 from browser_lock import FileMutex, FileMutexBusy
 
 
-ROLE_NAMES = ("invoice", "orders", "goods")
+ROLE_NAMES = ("home", "invoice", "orders", "goods")
 SUPPORTED_SCHEMA = 1
 LOGIN_URL_RE = re.compile(
     r"(?:^|[/?#._-])(login|signin|sign-in|passport|account/login|member/login)"
@@ -286,6 +286,10 @@ def _same_role_page(url: str, expected: str) -> bool:
         return False
     actual_path = urlsplit(url).path.rstrip("/") or "/"
     expected_path = urlsplit(expected).path.rstrip("/") or "/"
+    if expected_path == "/" and (urlsplit(expected).hostname or "").lower() == "myseller.taobao.com":
+        # Match the workbench's home role without treating order/invoice
+        # routes as the homepage or navigating over an unrelated user tab.
+        return actual_path in {"/", "/home.htm", "/home.htm/QnworkbenchHome"}
     return actual_path == expected_path or actual_path.startswith(expected_path + "/")
 
 
@@ -507,7 +511,7 @@ async def _terminate_owned_process(process: subprocess.Popen[Any] | None, pid: i
 
 
 class PlaywrightBrowserController:
-    """Attach to one native Edge CDP context and reuse three role pages."""
+    """Attach to one native Edge CDP context and reuse configured role pages."""
 
     def __init__(
         self,
@@ -515,12 +519,14 @@ class PlaywrightBrowserController:
         *,
         headless: bool = False,
         timeout_ms: int = 30_000,
+        lock_wait_ms: int = 0,
     ) -> None:
         self.config = dict(config)
         self.config.setdefault("profile_directory", "Default")
         self.config.setdefault("download_dir", str(Path(self.config["user_data_dir"]) / "downloads" / self.config["profile_directory"]))
         self.headless = bool(headless)
         self.timeout_ms = int(timeout_ms)
+        self.lock_wait_ms = max(0, min(int(lock_wait_ms), 5_000))
         self.specs = role_specs(self.config)
         self.playwright: Any = None
         self.browser: Any = None
@@ -552,6 +558,27 @@ class PlaywrightBrowserController:
         """
         return await self._open(allow_launch=False, open_missing=open_missing)
 
+    async def _acquire_profile_lock(self) -> None:
+        """Wait only for the local job mutex, before touching any browser."""
+        deadline = time.monotonic() + min(self.lock_wait_ms, max(0, self.timeout_ms)) / 1000
+        try:
+            while True:
+                try:
+                    self._profile_lock.acquire()
+                    return
+                except BrowserControllerError as exc:
+                    remaining = deadline - time.monotonic()
+                    if (exc.code != "profile_locked" or
+                            not isinstance(exc.__cause__, FileMutexBusy) or remaining <= 0):
+                        raise
+                    await asyncio.sleep(min(0.1, remaining))
+        except BaseException:
+            # Failed attempts own no handle. Cancellation must also leave no
+            # controller reference behind; never unlink the shared lock file.
+            self._profile_lock.release()
+            self._profile_lock = None
+            raise
+
     async def _open(self, *, allow_launch: bool, open_missing: bool) -> dict[str, Any]:
         if self.context is not None:
             return await self.register_roles(open_missing=open_missing)
@@ -570,12 +597,14 @@ class PlaywrightBrowserController:
         self._runtime_path = _runtime_state_path(data_dir, profile)
         self._cdp_port = _configured_debug_port(self.config)
         self._profile_lock = ProfileLock(data_dir, profile)
-        self._profile_lock.acquire()
+        await self._acquire_profile_lock()
         try:
             self.playwright = await async_playwright().start()
-        except Exception as exc:
+        except BaseException as exc:
             self._profile_lock.release()
             self._profile_lock = None
+            if not isinstance(exc, Exception):
+                raise
             raise BrowserControllerError(
                 f"Playwright 运行时启动失败: {exc}", "browser_launch_failed", retryable=True
             ) from exc

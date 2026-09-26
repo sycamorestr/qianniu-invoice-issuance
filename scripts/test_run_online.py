@@ -8,11 +8,13 @@ checkpoint and the fact that a resume consumes it without another browser call.
 from __future__ import annotations
 
 import json
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from zipfile import ZipFile
 
 import run_online
 
@@ -53,6 +55,146 @@ class RunOnlineTests(unittest.TestCase):
         run_online.atomic_json(runner.input_dir / "capture_context.json", {"coid": "c", "uid": "u"})
         run_online.atomic_json(runner.input_dir / "goods_codes.json", {"codes": codes})
 
+    def export_adapter(self, calls, content=b"", applications=None):
+        fake = FakeAdapter()
+        def adapter(site, operation, input_path, output_path):
+            calls.append((site, operation))
+            if operation == "applications":
+                payload = {"date": "2026-09-22", "rows": [], "total": 0,
+                           "api_total": 0, "observed_total": 0}
+                payload.update(applications or {})
+                return {"operation": operation, "payload": payload}
+            if operation == "export":
+                return content
+            return fake(site, operation, input_path, output_path)
+        return adapter
+
+    def workbook_bytes(self):
+        content = io.BytesIO()
+        with ZipFile(content, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+        return content.getvalue()
+
+    def test_zero_applications_and_empty_export_complete_without_business_workbooks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            calls = []
+            adapter = self.export_adapter(calls)
+            runner = self.make_runner(root, adapter)
+            with patch.object(runner, "_orders") as orders, patch.object(runner, "_jst") as jst, \
+                    patch.object(runner, "_probe_and_details") as probe, \
+                    patch.object(runner, "_run_invoice") as generate:
+                result = runner.run()
+                for stage in (orders, jst, probe, generate):
+                    stage.assert_not_called()
+            self.assertEqual(result["status"], "no_applications")
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+            self.assertEqual((runner.input_dir / "common-export.bin").read_bytes(), b"")
+            self.assertFalse(list(runner.run_dir.rglob("*.xlsx")))
+            self.assertTrue(runner.state["stages"]["export"]["empty_export"])
+            manifest_path = runner.generated_dir / "run.json"
+            manifest_bytes = manifest_path.read_bytes()
+            manifest = run_online.read_json(manifest_path)
+            self.assertIsNone(manifest["output"])
+            self.assertIsNone(manifest["common_template_output"])
+            self.assertEqual(manifest["empty_export"]["sha256"], run_online.file_sha256(runner.input_dir / "common-export.bin"))
+            self.assertEqual(manifest["empty_export"]["reason"], "applications_and_export_empty")
+            for key in ("selected_count", "ready_count", "blocked_count", "excluded_count", "detail_rows"):
+                self.assertEqual(manifest[key], 0)
+            for key in ("ready_amount", "blocked_amount", "excluded_amount"):
+                self.assertEqual(manifest[key], "0.00")
+            self.assertEqual((runner.generated_dir / "exceptions.csv").read_text(encoding="utf-8-sig").splitlines(),
+                             ["申请流水号,金额,暂缓原因"])
+            self.assertEqual({Path(item["path"]).name for item in runner.state["stages"]["generate"]["outputs"]},
+                             {"run.json", "exceptions.csv"})
+            resumed = self.make_runner(root, adapter, resume=runner.run_dir)
+            with patch.object(resumed, "_run_invoice", side_effect=AssertionError("must not generate")):
+                self.assertEqual(resumed.run()["status"], "no_applications")
+            self.assertEqual(calls.count(("qianniu", "applications")), 1)
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+            self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+
+    def test_empty_export_requires_all_explicit_zero_list_evidence(self):
+        cases = ({"total": 1}, {"api_total": None}, {"observed_total": 1},
+                 {"total": False}, {"total": "0"}, {"rows": [{"id": "unexpected"}]})
+        for invalid in cases:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temp:
+                calls = []
+                runner = self.make_runner(Path(temp), self.export_adapter(calls, applications=invalid))
+                runner._context()
+                with self.assertRaises(run_online.OnlineError) as error:
+                    runner._applications_export()
+                self.assertEqual(error.exception.code, "empty_export_unverified")
+                self.assertEqual(calls.count(("qianniu", "export")), 1)
+                self.assertFalse(runner.stage_is_done("export"))
+                self.assertFalse(runner.generated_dir.exists())
+                self.assertEqual((runner.input_dir / "common-export.bin").read_bytes(), b"")
+
+    def test_zero_list_still_exports_and_preserves_nonempty_workbook_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            workbook = self.workbook_bytes()
+            adapter = self.export_adapter(calls, workbook)
+            runner = self.make_runner(Path(temp), adapter)
+            runner._context()
+            runner._applications_export()
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+            self.assertEqual((runner.input_dir / "common-export.bin").read_bytes(), workbook)
+            self.assertEqual((runner.input_dir / "qianniu_common.xlsx").read_bytes(), workbook)
+            self.assertIsNone(runner._empty_export_evidence())
+            resumed = self.make_runner(Path(temp), adapter, resume=runner.run_dir)
+            resumed._applications_export()
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+
+    def test_nonempty_nonzip_export_never_becomes_no_applications(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            runner = self.make_runner(Path(temp), self.export_adapter(calls, b"<html>login</html>"))
+            runner._context()
+            with self.assertRaises(run_online.OnlineError) as error:
+                runner._applications_export()
+            self.assertEqual(error.exception.code, "checkpoint_invalid")
+            self.assertEqual((runner.input_dir / "common-export.bin").read_bytes(), b"<html>login</html>")
+            self.assertFalse((runner.input_dir / "qianniu_common.xlsx").exists())
+
+    def test_legacy_export_receipt_keeps_xlsx_path_without_requery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            workbook = self.workbook_bytes()
+            adapter = self.export_adapter(calls, workbook)
+            runner = self.make_runner(Path(temp), adapter)
+            runner._context()
+            original = runner.input_dir / "qianniu_common.xlsx"
+            runner.collect("qianniu", "export", {"date": runner.date, "agentId": "agent-1",
+                           "expected_store": runner.store, "expected_issuer": runner.issuer},
+                           original, "export", binary=True)
+            receipt = (runner.run_dir / "receipts" / "export.json").read_bytes()
+            resumed = self.make_runner(Path(temp), adapter, resume=runner.run_dir)
+            resumed._applications_export()
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+            self.assertEqual(original.read_bytes(), workbook)
+            self.assertFalse((runner.input_dir / "common-export.bin").exists())
+            self.assertEqual((runner.run_dir / "receipts" / "export.json").read_bytes(), receipt)
+            self.assertIsNone(resumed._empty_export_evidence())
+
+    def test_empty_generation_recovers_after_manifest_publication_without_export_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            adapter = self.export_adapter(calls)
+            runner = self.make_runner(Path(temp), adapter)
+            original_done = runner.stage_done
+            def interrupt(name, *args, **kwargs):
+                if name == "generate":
+                    raise run_online.OnlineError("interrupted after generation", "interrupted")
+                return original_done(name, *args, **kwargs)
+            with patch.object(runner, "stage_done", side_effect=interrupt), self.assertRaises(run_online.OnlineError):
+                runner.run()
+            original = (runner.generated_dir / "run.json").read_bytes()
+            resumed = self.make_runner(Path(temp), adapter, resume=runner.run_dir)
+            self.assertEqual(resumed.run()["status"], "no_applications")
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+            self.assertEqual((resumed.generated_dir / "run.json").read_bytes(), original)
+
     def split_configs(self, root):
         qianniu = root / "qianniu-browser.json"
         jst = root / "jst-browser.json"
@@ -67,6 +209,149 @@ class RunOnlineTests(unittest.TestCase):
             "browser_sessions": {"goods": "https://fp.erp321.com/setting/goodsManage"},
         }), encoding="utf-8")
         return qianniu, jst
+
+    def account_adapter(self, requests, *, observed_store="tb-store", account_nick="tb-store:operator"):
+        def adapter(site, operation, input_path, output_path):
+            payload = run_online.read_json(input_path)
+            requests.append((site, operation, payload))
+            if site == "qianniu" and operation == "context":
+                value = {"isLogin": True, "store": payload["expected_store"], "agentId": "agent-1",
+                         "observed_store": observed_store, "account_nick": account_nick}
+            elif site == "jst" and operation == "context":
+                value = {"isLogin": True, "issuer": payload["expected_issuer"], "coid": "co-1", "uid": "u-1"}
+            else:
+                value = {"operation": operation}
+            return {"operation": operation, "payload": value}
+        return adapter
+
+    def test_expected_account_is_saved_and_sent_only_to_qianniu_context(self):
+        requests = []
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runner = self.make_runner(root, self.account_adapter(requests), expected_account="tb-store:operator")
+            runner._context()
+            runner.collect("qianniu", "test", {}, runner.run_dir / "other.json", "other")
+            self.assertEqual(runner.state["expected_account"], "tb-store:operator")
+            capture = run_online.read_json(runner.input_dir / "capture_context.json")
+            self.assertEqual(capture["store"], "店")
+            self.assertEqual(capture["observed_store"], "tb-store")
+            self.assertEqual(capture["account_nick"], "tb-store:operator")
+            self.assertEqual(requests[0][2]["expected_account"], "tb-store:operator")
+            for site, operation, payload in requests[1:]:
+                self.assertNotIn("expected_account", payload, (site, operation))
+            resumed = self.make_runner(root, self.account_adapter(requests), resume=runner.run_dir)
+            self.assertEqual(resumed.expected_account, "tb-store:operator")
+            resumed._context()
+            refresh_request = next(payload for site, operation, payload in requests[3:] if site == "qianniu")
+            self.assertEqual(refresh_request["expected_observed_store"], "tb-store")
+            self.assertEqual(refresh_request["expected_account_nick"], "tb-store:operator")
+            self.assertEqual(refresh_request["expected_account"], "tb-store:operator")
+        self.assertEqual(run_online.build_parser().parse_args(["--expected-account", "tb-store:operator"]).expected_account,
+                         "tb-store:operator")
+
+    def test_expected_account_cannot_change_after_it_was_fixed_even_before_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runner = self.make_runner(root, FakeAdapter(), expected_account="store:operator")
+            before = (runner.run_dir / "run-state.json").read_bytes()
+            with self.assertRaises(run_online.OnlineError) as error:
+                self.make_runner(root, FakeAdapter(), resume=runner.run_dir, expected_account="store:other")
+            self.assertEqual(error.exception.code, "resume_mismatch")
+            self.assertEqual((runner.run_dir / "run-state.json").read_bytes(), before)
+
+    def test_legacy_failed_context_can_add_first_account_without_changing_other_request_hashes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake = FakeAdapter()
+            def fail_context(site, operation, input_path, output_path):
+                if site == "qianniu" and operation == "context":
+                    raise run_online.OnlineError("store mismatch", "context_changed_store")
+                return fake(site, operation, input_path, output_path)
+            runner = self.make_runner(root, fail_context)
+            other_path = runner.run_dir / "other.json"
+            runner.collect("qianniu", "test", {}, other_path, "other")
+            other_receipt = runner.run_dir / "receipts" / "other.json"
+            original_receipt = other_receipt.read_bytes()
+            with self.assertRaises(run_online.OnlineError):
+                runner._context()
+            self.assertFalse((runner.input_dir / "context_qianniu.json").exists())
+            state = run_online.read_json(runner.run_dir / "run-state.json")
+            state.pop("expected_account", None)
+            run_online.atomic_json(runner.run_dir / "run-state.json", state)
+            requests = []
+            resumed = self.make_runner(root, self.account_adapter(requests), resume=runner.run_dir,
+                                       expected_account="tb-store:operator")
+            resumed.collect("qianniu", "test", {}, other_path, "other")
+            self.assertEqual(requests, [], "successful non-context checkpoint must be reused")
+            self.assertEqual(other_receipt.read_bytes(), original_receipt)
+            resumed._context()
+            self.assertTrue(resumed.stage_is_done("context"))
+            self.assertEqual(run_online.read_json(resumed.run_dir / "run-state.json")["expected_account"], "tb-store:operator")
+            self.assertTrue(all(payload.get("expected_account") == "tb-store:operator"
+                                for site, operation, payload in requests if site == "qianniu" and operation == "context"))
+
+    def test_legacy_committed_context_cannot_add_account_on_resume(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                fake = FakeAdapter()
+                def adapter(site, operation, input_path, output_path):
+                    if partial and site == "jst":
+                        raise run_online.OnlineError("login required", "auth_required")
+                    return fake(site, operation, input_path, output_path)
+                runner = self.make_runner(root, adapter)
+                if partial:
+                    with self.assertRaises(run_online.OnlineError):
+                        runner._context()
+                else:
+                    runner._context()
+                before = (runner.run_dir / "run-state.json").read_bytes()
+                with self.assertRaises(run_online.OnlineError) as error:
+                    self.make_runner(root, adapter, resume=runner.run_dir, expected_account="tb-store:operator")
+                self.assertEqual(error.exception.code, "resume_mismatch")
+                self.assertEqual((runner.run_dir / "run-state.json").read_bytes(), before)
+
+    def test_resume_rejects_changed_observed_store_or_account_even_if_display_store_matches(self):
+        for changed in ({"observed_store": "another-store"}, {"account_nick": "tb-store:another-operator"}):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                runner = self.make_runner(root, self.account_adapter([]), expected_account="tb-store:operator")
+                runner._context()
+                resumed = self.make_runner(root, self.account_adapter([], **changed), resume=runner.run_dir)
+                with self.assertRaises(run_online.OnlineError) as error:
+                    resumed._context()
+                self.assertEqual(error.exception.code, "context_changed")
+                self.assertEqual(error.exception.site, "qianniu")
+
+    def test_legacy_snapshot_without_observed_identity_fields_still_refreshes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runner = self.make_runner(root, FakeAdapter())
+            runner._context()
+            requests = []
+            resumed = self.make_runner(root, self.account_adapter(requests), resume=runner.run_dir)
+            resumed._context()
+            self.assertTrue(resumed.stage_is_done("context_refresh"))
+            request = next(payload for site, operation, payload in requests if site == "qianniu")
+            self.assertNotIn("expected_observed_store", request)
+            self.assertNotIn("expected_account_nick", request)
+
+    def test_connect_only_is_explicit_and_homepage_config_remains_unchanged(self):
+        self.assertFalse(run_online.build_parser().parse_args([]).connect_only)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            qianniu, jst = self.split_configs(root)
+            config = json.loads(qianniu.read_text(encoding='utf-8'))
+            config['browser_sessions'] = {'home': {'url': 'https://myseller.taobao.com/'}}
+            qianniu.write_text(json.dumps(config), encoding='utf-8')
+            original = qianniu.read_bytes()
+            with patch('playwright_adapter.PlaywrightAdapterRunner') as factory:
+                runner = self.make_runner(root, browser_config=qianniu, jst_browser_config=jst,
+                                          connect_only=True)
+                self.assertEqual(set(runner.browser_config['browser_sessions']), {'invoice', 'orders'})
+                runner._connect_browser()
+                self.assertFalse(factory.call_args.kwargs['launch_if_needed'])
+                self.assertEqual(qianniu.read_bytes(), original)
 
     def test_split_browser_option_routes_to_adapter_and_preserves_single_default(self):
         parser = run_online.build_parser()

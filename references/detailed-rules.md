@@ -4,7 +4,9 @@
 
 输入是申请日期，不是订单付款日期。单日导出与申请列表使用同一日期；长区间拆成平台允许的窗口，分别完成采集和范围核对。当前脚本的标准运行单元是一天。
 
-日常执行只附着已运行的专用浏览器；作业启动时先复用已有业务页，缺少固定 role 时由 `connect(open_missing=True)` 按配置 URL 自动补齐一次，不要求用户手动开页，也不启动新浏览器进程。登录跳转、验证码、主体不符或补页失败立即停止，不循环恢复。采集阶段已登记页面关闭或失效时，先找回同一 context 中已有页面，找不到返回 `page_missing` 并停止，不反复新建替代页。核对千牛店铺和票聚开票主体，写入 capture_context.json；coid、uid、agentId 来自本次已核对页面。页面存在及 URL 没有 login 字样不等于已登录，缺少正向主体证据时停止并申请人工介入。历史数据离线重放必须显式 --replay，不把历史核对时间改成当前时间。
+日常执行默认复用已运行的专用浏览器；确认环境未运行时，按现有持久化 `user_data_dir`、Profile 和固定非零端口正常启动 Edge 一次，读取原目录保存的会话，`--connect-only` 可禁止启动进程。作业复用已有业务页，缺少固定 role 时按业务 URL 自动补齐一次，不要求用户手动开页；工作台的主页配置由技能在内存中补入业务角色，原配置与主页保持不变。进程归属、端口或目录锁冲突不能通过换环境或循环启动绕过。登录跳转、验证码、主体不符或补页失败立即停止，不循环恢复。采集阶段已登记页面关闭或失效时，先找回同一 context 中已有页面，找不到返回 `page_missing` 并停止，不反复新建替代页。核对千牛店铺和票聚开票主体，写入 capture_context.json；coid、uid、agentId 来自本次已核对页面。页面存在及 URL 没有 login 字样不等于已登录，缺少正向主体证据时停止并申请人工介入。历史数据离线重放必须显式 --replay，不把历史核对时间改成当前时间。
+
+千牛身份核验支持已确认的完整子账号：清单 `login_username` 或单店 `--expected-account` 有值时，必须与当前页面 `context.realNick` 精确匹配，允许 `store` 保留工作台显示别名；没有账号约束时仍按原 `store` 精确核验。账号不是密码，也不能填普通备注、截断子账号或猜测别名。保留接口原始店铺昵称 `observed_store` 与账号 `account_nick`，恢复时固定原观察值及账号约束，不能借别名变化切换实际店铺；票聚主体及 agentId/coid/uid 的核对规则不变。
 
 申请列表仅用于完整性和订单关联诊断。服务端 `total` 可能是待处理计数，而分页数据仍可能夹带其他状态；分页总数必须稳定，流水号不能重复或漏页。`applyStatus`（包括值为 `1`）只记录列表快照，绝不能决定、扩大、缩小或覆盖本次输出范围。applications.json 的 rows 保留全部观察到的申请，list_non_pending_snapshot_rows 是其中非待处理状态的重叠诊断子集；api_total 是服务端 total，total/observed_total 是实际观察到的唯一流水号数。旧检查点的 excluded_non_pending_rows 仅作兼容读取，不再生成。
 
@@ -60,7 +62,7 @@ old_details.json 与 supplemental_details.json 都必须被消费。按可靠订
 
 完整申请数=通过数+暂缓数+排除数。负数发票记为排除，不计入可开数量和金额；exceptions.csv 保留“负数发票按规则不开具”及原负总金额，run.json 分别记录 excluded_count、excluded_amount。金额汇总使用申请总金额，不用残缺明细合计冒充暂缓金额。暂缓票缺少有效总金额时，暂缓合计标记为未知（null），不填零。没有申请正常返回 no_applications；全部排除返回 all_excluded；没有通过且存在暂缓票返回 all_blocked，均不制造可导入业务数据。
 
-终态交付规则：complete 交付原始通用模板副本、税局模板、异常清单和 run.json；no_applications、all_excluded 与 all_blocked 不交付可导入税局模板，但仍交付原始通用模板副本、异常清单和 run.json；failed 保留失败 run.json、已取得的原始通用模板与检查点，不能把未完成文件称作税局模板。导出前失败时没有原件可交付。
+终态交付规则：complete 交付原始通用模板副本、税局模板、异常清单和 run.json；no_applications、all_excluded 与 all_blocked 不交付可导入税局模板，但仍交付已取得的原始通用模板副本、异常清单和 run.json。仅当列表明确为空且实际导出 HTTP 成功、响应为零字节时，no_applications 没有原件可交付，改为保留查询快照、空响应 common-export.bin、异常表头和报告，不制造 XLSX；列表为零但导出非空仍按通用模板处理，完整判定见[输入输出](input-output-contract.md#原始检查点)。failed 保留失败 run.json、已取得的原始通用模板与检查点，不能把未完成文件称作税局模板。导出前失败时没有原件可交付。
 
 生成前检查全局错误。写入临时文件，独立复核成功后才命名为最终 XLSX。独立复核覆盖源正行、订单关联、数量、金额、折扣、票聚字段、税率、基本信息、四表结构及原模板部件。run.json 保存输入哈希和结果状态。
 

@@ -24,11 +24,12 @@ ROLE_URLS = {
     "orders": ORDERS_URL,
     "goods": "https://fp.erp321.com/setting/goodsManage",
 }
+HOME_URL = "https://myseller.taobao.com/"
 
 
 def config_for(roles, data_dir):
     return {"schema_version": 1, "browser": "Edge", "user_data_dir": str(data_dir),
-            "browser_sessions": {role: {"url": ROLE_URLS[role]} for role in roles}}
+            "browser_sessions": {role: {"url": HOME_URL if role == "home" else ROLE_URLS[role]} for role in roles}}
 
 
 def write_config(root, name, roles, directory):
@@ -80,17 +81,73 @@ def make_runner(controller: FakeController) -> playwright_adapter.PlaywrightAdap
 
 
 class PlaywrightAdapterTests(unittest.TestCase):
-    def test_daily_adapter_restores_missing_pages_without_starting_browser(self):
+    def test_daily_adapter_uses_native_start_entry_point_without_connect_fallback(self):
         controller = type("AttachedController", (), {
             "connect": AsyncMock(), "close": AsyncMock(), "start": AsyncMock(),
         })()
         config = config_for(ROLE_URLS, "unused")
         with patch.object(playwright_adapter, "load_browser_config", return_value=(config, Path("unused"))), \
-                patch.object(playwright_adapter, "PlaywrightBrowserController", return_value=controller):
+                patch.object(playwright_adapter, "PlaywrightBrowserController", return_value=controller) as create:
             runner = playwright_adapter.PlaywrightAdapterRunner(Path("unused"))
             runner.close()
+        self.assertEqual(create.call_args.kwargs["lock_wait_ms"], 5_000)
+        controller.start.assert_awaited_once_with(open_missing=True)
+        controller.connect.assert_not_awaited()
+        controller.close.assert_awaited_once()
+
+    def test_connect_only_adapter_never_calls_start(self):
+        controller = Mock(connect=AsyncMock(), close=AsyncMock(), start=AsyncMock())
+        config = config_for(ROLE_URLS, "unused")
+        with patch.object(playwright_adapter, "load_browser_config", return_value=(config, Path("unused"))), \
+                patch.object(playwright_adapter, "PlaywrightBrowserController", return_value=controller) as create:
+            runner = playwright_adapter.PlaywrightAdapterRunner(Path("unused"), launch_if_needed=False)
+            runner.close()
+        self.assertEqual(create.call_args.kwargs["lock_wait_ms"], 5_000)
         controller.connect.assert_awaited_once_with(open_missing=True)
         controller.start.assert_not_awaited()
+
+    def test_connect_only_failure_is_not_retried_as_native_start(self):
+        controller = Mock(connect=AsyncMock(side_effect=BrowserControllerError("未启动", "browser_disconnected")),
+                          close=AsyncMock(), start=AsyncMock())
+        config = config_for(ROLE_URLS, "unused")
+        with patch.object(playwright_adapter, "load_browser_config", return_value=(config, Path("unused"))), \
+                patch.object(playwright_adapter, "PlaywrightBrowserController", return_value=controller):
+            with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
+                playwright_adapter.PlaywrightAdapterRunner(Path("unused"), launch_if_needed=False)
+        self.assertEqual(error.exception.code, "browser_disconnected")
+        controller.connect.assert_awaited_once()
+        controller.start.assert_not_awaited()
+        controller.close.assert_awaited_once()
+
+    def test_workbench_home_config_is_expanded_only_in_memory_and_shared_goods_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            shop = write_config(root, "shop", ("home",), "shop")
+            goods = write_config(root, "goods", ("goods",), "shared")
+            original_shop, original_goods = shop.read_bytes(), goods.read_bytes()
+            configurations = []
+            def create(config, **_kwargs):
+                configurations.append(config)
+                return Mock(start=AsyncMock(), close=AsyncMock())
+            with patch.object(playwright_adapter, "PlaywrightBrowserController", side_effect=create):
+                runner = playwright_adapter.PlaywrightAdapterRunner(shop, jst_config_path=goods)
+                runner.close()
+            self.assertEqual(shop.read_bytes(), original_shop)
+            self.assertEqual(goods.read_bytes(), original_goods)
+            self.assertEqual({frozenset(value["browser_sessions"]) for value in configurations},
+                             {frozenset({"invoice", "orders"}), frozenset({"goods"})})
+            qianniu = next(value for value in configurations if "invoice" in value["browser_sessions"])
+            self.assertEqual(qianniu["browser_sessions"]["invoice"]["url"], ROLE_URLS["invoice"])
+            self.assertEqual(qianniu["browser_sessions"]["orders"]["url"], ROLE_URLS["orders"])
+
+    def test_invalid_invoice_config_conversion_is_typed_before_creating_controller(self):
+        with patch.object(playwright_adapter, "load_browser_config", return_value=(config_for(ROLE_URLS, "unused"), Path("unused"))), \
+                patch.object(playwright_adapter, "with_invoice_pages", side_effect=ValueError("无效主页配置")), \
+                patch.object(playwright_adapter, "PlaywrightBrowserController") as create:
+            with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
+                playwright_adapter.PlaywrightAdapterRunner(Path("unused"))
+        self.assertEqual(error.exception.code, "configuration")
+        self.assertEqual(error.exception.site, "qianniu")
+        create.assert_not_called()
 
     def test_detail_waits_for_exact_order_and_ready_goods_code_row(self):
         order_no = "9000000000000000001"
@@ -254,12 +311,13 @@ class PlaywrightAdapterTests(unittest.TestCase):
             def create(config, **_kwargs):
                 site = "jst" if "goods" in config["browser_sessions"] else "qianniu"
                 instance = Mock()
-                async def connect(**kwargs):
+                async def start(**kwargs):
                     self.assertEqual(kwargs, {"open_missing": True})
-                    events.append(("connect", site))
+                    events.append(("start", site))
                 async def close():
                     events.append(("close", site))
-                instance.connect = AsyncMock(side_effect=connect)
+                instance.start = AsyncMock(side_effect=start)
+                instance.connect = AsyncMock()
                 instance.close = AsyncMock(side_effect=close)
                 instance.status.return_value = {"roles": {role: {"target_id": f"target-{role}"}
                                                          for role in config["browser_sessions"]}}
@@ -269,7 +327,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
             with patch.object(playwright_adapter, "PlaywrightBrowserController", side_effect=create):
                 runner = playwright_adapter.PlaywrightAdapterRunner(shop, jst_config_path=goods)
                 try:
-                    self.assertEqual(events, [("connect", "jst"), ("connect", "qianniu")])
+                    self.assertEqual(events, [("start", "jst"), ("start", "qianniu")])
                     self.assertEqual(runner._call(runner._pages_receipt()),
                                      {role: f"target-{role}" for role in ROLE_URLS})
                     for instance in instances.values():
@@ -280,13 +338,14 @@ class PlaywrightAdapterTests(unittest.TestCase):
             self.assertEqual(events[-2:], [("close", "qianniu"), ("close", "jst")])
             for instance in instances.values():
                 instance.stop.assert_not_called()
+                instance.connect.assert_not_awaited()
 
     def test_second_browser_connect_failure_detaches_both_and_preserves_site(self):
         with tempfile.TemporaryDirectory() as root:
             shop = write_config(root, "shop", ("invoice", "orders"), "a-shop")
             goods = write_config(root, "goods", ("goods",), "z-shared")
-            first = Mock(connect=AsyncMock(), close=AsyncMock())
-            second = Mock(connect=AsyncMock(side_effect=BrowserControllerError("共享会话失效", "login_required")),
+            first = Mock(start=AsyncMock(), close=AsyncMock())
+            second = Mock(start=AsyncMock(side_effect=BrowserControllerError("共享会话失效", "login_required")),
                           close=AsyncMock())
             with patch.object(playwright_adapter, "PlaywrightBrowserController", side_effect=[first, second]):
                 with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
@@ -297,13 +356,17 @@ class PlaywrightAdapterTests(unittest.TestCase):
             second.close.assert_awaited_once()
             first.stop.assert_not_called()
             second.stop.assert_not_called()
+            first.start.assert_awaited_once()
+            second.start.assert_awaited_once()
+            first.connect.assert_not_called()
+            second.connect.assert_not_called()
 
     def test_shared_profile_mutex_covers_whole_job_and_failed_shop_releases_its_lock(self):
         class LockedController:
             def __init__(self, config, **_kwargs):
                 self.lock = ProfileLock(Path(config["user_data_dir"]), "Default")
 
-            async def connect(self, **_kwargs):
+            async def start(self, **_kwargs):
                 self.lock.acquire()
 
             async def close(self):
@@ -339,8 +402,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
                     await asyncio.Event().wait()
                 finally:
                     cancelled.append(True)
-            first = Mock(connect=AsyncMock(), close=AsyncMock())
-            second = Mock(connect=AsyncMock(side_effect=never_ready), close=AsyncMock())
+            first = Mock(start=AsyncMock(), close=AsyncMock())
+            second = Mock(start=AsyncMock(side_effect=never_ready), close=AsyncMock())
             with patch.object(playwright_adapter, "PlaywrightBrowserController", side_effect=[first, second]):
                 with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
                     playwright_adapter.PlaywrightAdapterRunner(shop, jst_config_path=goods, timeout_ms=5)
@@ -349,6 +412,41 @@ class PlaywrightAdapterTests(unittest.TestCase):
             self.assertEqual(cancelled, [True])
             first.close.assert_awaited_once()
             second.close.assert_awaited_once()
+
+    def test_native_start_timeout_releases_real_profile_locks_without_stopping_browsers(self):
+        instances = []
+        class LockedController:
+            def __init__(self, config, **_kwargs):
+                self.lock = ProfileLock(Path(config["user_data_dir"]), "Default")
+                self.goods = "goods" in config["browser_sessions"]
+                self.cancelled = False
+                self.stop = Mock()
+                instances.append(self)
+
+            async def start(self, **_kwargs):
+                self.lock.acquire()
+                if self.goods:
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        self.cancelled = True
+
+            async def close(self):
+                self.lock.release()
+
+        with tempfile.TemporaryDirectory() as root:
+            shop = write_config(root, "shop", ("invoice", "orders"), "a-shop")
+            goods = write_config(root, "goods", ("goods",), "z-shared")
+            with patch.object(playwright_adapter, "PlaywrightBrowserController", LockedController):
+                with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
+                    playwright_adapter.PlaywrightAdapterRunner(shop, jst_config_path=goods, timeout_ms=10)
+            self.assertEqual(error.exception.site, "jst")
+            self.assertTrue(instances[1].cancelled)
+            for instance in instances:
+                self.assertFalse(instance.lock.owned)
+                instance.lock.acquire()
+                instance.lock.release()
+                instance.stop.assert_not_called()
 
     def test_split_context_query_and_detail_route_to_their_own_browser(self):
         order_no = "9000000000000000001"
@@ -405,6 +503,76 @@ class PlaywrightAdapterTests(unittest.TestCase):
             asyncio.run(runner._invoke_async("jst", "query", {"codes": ["TEST-SKU"]}, False))
         self.assertEqual(error.exception.code, "auth_required")
         self.assertEqual(error.exception.site, "jst")
+
+    def test_known_script_errors_are_typed_without_losing_site_or_original_cause(self):
+        tokens = {
+            "login_required": "auth_required",
+            "permission_required": "permission_required",
+            "context_changed_store": "context_changed",
+            "context_changed_account": "context_changed",
+            "context_missing_store": "context_missing",
+            "context_missing_agent_id": "context_missing",
+            "context_missing_account": "context_missing",
+        }
+        for site, operation in (("qianniu", "context"), ("jst", "query")):
+            for token, expected in tokens.items():
+                with self.subTest(site=site, token=token):
+                    source = BrowserControllerError(
+                        f"页面脚本执行失败: Page.evaluate: Error: {token}\n    at eval (eval:1:1)",
+                        "script_failed",
+                    )
+                    controller = Mock(evaluate_file=AsyncMock(side_effect=source))
+                    runner = make_runner(controller)
+                    with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+                        asyncio.run(runner._invoke_async(site, operation, {}, False))
+                    self.assertEqual(caught.exception.code, expected)
+                    self.assertEqual(caught.exception.site, site)
+                    self.assertEqual(str(caught.exception), str(source))
+                    self.assertIs(caught.exception.__cause__, source)
+
+    def test_unrecognized_script_errors_remain_fatal(self):
+        messages = (
+            "Page.evaluate: Error: login_required_extra",
+            "Page.evaluate: Error: context_changed_storefront",
+            "Page.evaluate: Error: context_missing_tenant",
+            "Page.evaluate: TypeError: login_required",
+            "Page.evaluate: Error: unknown_failure\n    Error: login_required",
+            "Page.evaluate: Error: upstream response mentions login_required",
+            "Page.evaluate: Error: 'login_required'",
+            "Page.evaluate: Error: login_required: unrelated details",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                controller = Mock(evaluate_file=AsyncMock(side_effect=BrowserControllerError(
+                    "页面脚本执行失败: " + message, "script_failed")))
+                runner = make_runner(controller)
+                with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+                    asyncio.run(runner._invoke_async("qianniu", "context", {}, False))
+                self.assertEqual(caught.exception.code, "script_failed")
+                self.assertEqual(caught.exception.site, "qianniu")
+
+    def test_error_text_does_not_override_an_existing_controller_error_code(self):
+        controller = Mock(evaluate_file=AsyncMock(side_effect=BrowserControllerError(
+            "Page.evaluate: Error: login_required", "page_missing")))
+        runner = make_runner(controller)
+        with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+            asyncio.run(runner._invoke_async("qianniu", "context", {}, False))
+        self.assertEqual(caught.exception.code, "page_missing")
+
+    def test_sync_call_classifies_known_script_error_and_preserves_site(self):
+        class FailedFuture:
+            def result(self, timeout):
+                raise BrowserControllerError("Page.evaluate: Error: login_required", "script_failed")
+
+        runner = object.__new__(playwright_adapter.PlaywrightAdapterRunner)
+        runner._closed = False
+        runner.loop = object()
+        runner.timeout_ms = 30_000
+        with patch.object(asyncio, "run_coroutine_threadsafe", return_value=FailedFuture()):
+            with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+                runner._call(object(), site="jst")
+        self.assertEqual(caught.exception.code, "auth_required")
+        self.assertEqual(caught.exception.site, "jst")
 
     def test_call_preserves_typed_controller_error(self):
         class FailedFuture:

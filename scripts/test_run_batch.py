@@ -6,7 +6,7 @@ from pathlib import Path
 
 from manage_browsers import initialize
 from run_batch import BatchRunner
-from run_online import OnlineError
+from run_online import OnlineError, file_sha256
 from shop_registry import load_registry
 
 
@@ -51,6 +51,26 @@ class Jobs:
         return result
 
 
+class EmptyJobs(Jobs):
+    def run(self):
+        k = self.kwargs
+        root = k.get('run_dir') or k['resume']
+        generated = root / 'generated'
+        generated.mkdir(parents=True)
+        evidence = root / 'common-export.bin'
+        evidence.write_bytes(b'')
+        result = {'status': 'no_applications', 'generated_dir': str(generated),
+                  'ready_count': 0, 'blocked_count': 0, 'excluded_count': 0,
+                  'ready_amount': '0', 'blocked_amount': '0', 'excluded_amount': '0'}
+        write(root / 'run-state.json', {'date': k['date'], 'generated_dir': str(generated),
+                                       'stages': {}, 'input_hashes': []})
+        write(root / 'run.json', result)
+        write(generated / 'run.json', {**result, 'common_template_output': None,
+              'empty_export': {'path': str(evidence), 'sha256': file_sha256(evidence)}})
+        (generated / 'exceptions.csv').write_text('申请流水号,金额,暂缓原因\n', encoding='utf-8')
+        return result
+
+
 class BatchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -78,6 +98,19 @@ class BatchTests(unittest.TestCase):
         self.batch(replay, resume=batch.run_dir).run()
         self.assertEqual(replay.calls, [])
 
+    def test_verified_empty_export_needs_no_fabricated_common_file(self):
+        batch = self.batch(EmptyJobs(), shops=['shop01'])
+        result = batch.run()
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['shops'][0]['status'], 'no_applications')
+        self.assertIsNone(result['shops'][0]['common_template'])
+        resumed = Jobs()
+        self.batch(resumed, resume=batch.run_dir).run()
+        self.assertEqual(resumed.calls, [])
+        (batch.run_dir / 'shops/shop01/common-export.bin').write_bytes(b'changed')
+        with self.assertRaises(OnlineError):
+            self.batch(Jobs(), resume=batch.run_dir).run()
+
     def test_shop_auth_failure_continues_and_resume_retries_only_failed_shop(self):
         jobs = Jobs({'Test shop 2': 'qianniu'})
         batch = self.batch(jobs)
@@ -89,6 +122,19 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result['status'], 'complete')
         self.assertEqual([k['store'] for k in followup.calls], ['Test shop 2'])
         self.assertIn('resume', followup.calls[0])
+
+    def test_shop_permission_failure_does_not_block_other_shops(self):
+        class PermissionJobs(Jobs):
+            def run(self):
+                if self.kwargs['store'] == 'Test shop 1':
+                    raise OnlineError('permission_required', 'permission_required', site='qianniu')
+                return super().run()
+        jobs = PermissionJobs()
+        result = self.batch(jobs, shops=['shop01', 'shop02']).run()
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(len(jobs.calls), 2)
+        self.assertIn('权限', result['shops'][0]['recovery_action'])
+        self.assertEqual(result['shops'][1]['status'], 'complete')
 
     def test_shared_failure_stops_once_then_resumes_remaining_shops(self):
         jobs = Jobs({'Test shop 2': 'jst'})
@@ -119,6 +165,19 @@ class BatchTests(unittest.TestCase):
         value['profile_directory'] = 'Profile 2'
         write(config, value)
         with self.assertRaises(OnlineError):
+            self.batch(Jobs(), resume=batch.run_dir)
+
+    def test_account_binding_is_routed_and_cannot_change_on_resume(self):
+        registry = json.loads(self.registry.read_text(encoding='utf-8'))
+        registry['shops'][0]['login_username'] = 'account:operator'
+        write(self.registry, registry)
+        jobs = Jobs()
+        batch = self.batch(jobs, shops=['shop01'])
+        batch.run()
+        self.assertEqual(jobs.calls[0]['expected_account'], 'account:operator')
+        registry['shops'][0]['login_username'] = 'another:operator'
+        write(self.registry, registry)
+        with self.assertRaisesRegex(OnlineError, '登录账号'):
             self.batch(Jobs(), resume=batch.run_dir)
 
     def test_edited_pending_shop_identity_rejected_before_requests(self):
@@ -172,6 +231,47 @@ class BatchTests(unittest.TestCase):
         self.assertTrue((batch.run_dir / 'batch-summary.csv').is_file())
         with self.assertRaises(OnlineError):
             self.batch(Jobs(), shops=['shop03', 'shop03'])
+
+    def test_resume_keeps_selection_when_workbench_adds_a_shop(self):
+        batch = self.batch(Jobs(), shops=['shop01'])
+        batch.run()
+        config = self.root / 'work/new-browser.json'
+        write(config, {'schema_version': 1, 'browser': 'Edge',
+                       'user_data_dir': 'new-shop-profile', 'download_dir': 'new-shop-downloads',
+                       'remote_debugging_port': 19999,
+                       'browser_sessions': {'home': {'url': 'https://myseller.taobao.com/'}}})
+        write(self.registry.parent / '.browser-workbench-shops.json', {
+            'schema_version': 1, 'shops': [{'id': 'shop-new', 'store': 'New display label',
+                                         'browser_config': str(config)}]})
+        resumed = Jobs()
+        result = self.batch(resumed, resume=batch.run_dir).run()
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['selected_shops'], 1)
+        self.assertEqual(resumed.calls, [])
+        self.assertEqual(len(self.batch(Jobs()).state['shops']), 10)
+
+    def test_resume_rejects_changed_selected_profile_and_supports_legacy_state(self):
+        batch = self.batch(Jobs(), shops=['shop01'])
+        batch.run()
+        state_path = batch.run_dir / 'batch-state.json'
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        state.update(version=1, registry_identity_sha256=load_registry(self.registry)['identity_sha256'])
+        write(state_path, state)
+        self.assertEqual(self.batch(Jobs(), resume=batch.run_dir).run()['status'], 'complete')
+        config = self.registry.parent / 'config/shop01.json'
+        value = json.loads(config.read_text(encoding='utf-8'))
+        value['user_data_dir'] = '../different-profile'
+        write(config, value)
+        with self.assertRaises(OnlineError):
+            self.batch(Jobs(), resume=batch.run_dir)
+
+    def test_connect_only_passes_to_every_shop_and_failure_has_recovery_details(self):
+        jobs = Jobs({'Test shop 2': 'qianniu'})
+        result = self.batch(jobs, connect_only=True).run()
+        self.assertTrue(all(call['connect_only'] for call in jobs.calls))
+        failure = result['shops'][1]
+        self.assertIn('人工登录', failure['recovery_action'])
+        self.assertIsInstance(failure['elapsed_seconds'], float)
 
 
 if __name__ == '__main__':

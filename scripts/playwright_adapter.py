@@ -13,11 +13,13 @@ import base64
 from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from invoice_browser_config import with_invoice_pages
 from playwright_controller import (
     BrowserControllerError,
     PlaywrightBrowserController,
@@ -40,8 +42,32 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _controller_error_code(error: BrowserControllerError) -> str:
+    """Recover only known JS error tokens from the exception headline."""
+    if error.code != "script_failed":
+        return error.code
+    codes = {
+        "login_required": "auth_required",
+        "permission_required": "permission_required",
+        "context_changed_store": "context_changed",
+        "context_changed_account": "context_changed",
+        "context_missing_store": "context_missing",
+        "context_missing_agent_id": "context_missing",
+        "context_missing_account": "context_missing",
+    }
+    # Playwright appends a stack after its first line. Do not reinterpret a
+    # quoted token, a longer token, or a token appearing only in that stack.
+    headline = str(error).splitlines()[0] if str(error) else ""
+    match = re.search(r"(?:^|:\s*)Error:\s*([a-z_]+)\s*$", headline)
+    return codes.get(match.group(1), error.code) if match else error.code
+
+
 class PlaywrightAdapterRunner:
-    """Run page scripts in one or two persistent browser contexts."""
+    """Run scripts in one or two profiles, starting missing browsers on demand.
+
+    ``launch_if_needed=False`` requires already-running native browsers while
+    still preparing missing business pages for this invoice job.
+    """
 
     accepts_binary = True
 
@@ -71,11 +97,15 @@ orderNo => {
     def __init__(self, config_path: Path, *, jst_config_path: Path | None = None,
                  profile_directory: str | None = None,
                  timeout_ms: int = 30_000,
+                 launch_if_needed: bool = True,
                  progress: Callable[[str], None] | None = None) -> None:
         try:
             self.config, self.config_path = load_browser_config(config_path, profile_directory=profile_directory)
+            self.config = with_invoice_pages(self.config)
         except BrowserControllerError as exc:
             raise PlaywrightAdapterError(str(exc), exc.code, site="qianniu") from exc
+        except ValueError as exc:
+            raise PlaywrightAdapterError(str(exc), "configuration", site="qianniu") from exc
         self.jst_config: dict[str, Any] | None = None
         self.jst_config_path: Path | None = None
         if jst_config_path is not None:
@@ -100,6 +130,7 @@ orderNo => {
                 "单浏览器配置必须包含 invoice、orders、goods 三个角色", "configuration", site="qianniu"
             )
         self.timeout_ms = timeout_ms
+        self.launch_if_needed = bool(launch_if_needed)
         self.progress = progress or (lambda _message: None)
         self.skill_dir = Path(__file__).resolve().parent
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -130,13 +161,17 @@ orderNo => {
         for site, config in sorted(configurations, key=lambda item: self._profile_key(item[1])):
             self._starting_site = site
             try:
-                controller = PlaywrightBrowserController(config, timeout_ms=self.timeout_ms)
+                controller = PlaywrightBrowserController(config, timeout_ms=self.timeout_ms, lock_wait_ms=5_000)
                 self._created_controllers.append(controller)
                 self.controllers[site] = controller
                 if site == "qianniu":
                     self.controller = controller
+                # start() validates ownership and reuses a correct running
+                # environment itself. Never retry a failed connect by blindly
+                # starting another browser or bypassing a login/profile error.
+                open_browser = controller.start if self.launch_if_needed else controller.connect
                 await asyncio.wait_for(
-                    controller.connect(open_missing=True), timeout=max(0.001, self.timeout_ms / 1000)
+                    open_browser(open_missing=True), timeout=max(0.001, self.timeout_ms / 1000)
                 )
             except asyncio.CancelledError:
                 raise
@@ -210,7 +245,7 @@ orderNo => {
         if isinstance(error, PlaywrightAdapterError):
             raise error
         if isinstance(error, BrowserControllerError):
-            raise PlaywrightAdapterError(str(error), error.code, site=site) from error
+            raise PlaywrightAdapterError(str(error), _controller_error_code(error), site=site) from error
         raise PlaywrightAdapterError(str(error), "browser_launch_failed", site=site) from error
 
     def _call(self, coroutine: Any, *, site: str | None = None) -> Any:
@@ -352,7 +387,7 @@ orderNo => {
                 exc.site = site
             raise
         except BrowserControllerError as exc:
-            raise PlaywrightAdapterError(str(exc), exc.code, site=site) from exc
+            raise PlaywrightAdapterError(str(exc), _controller_error_code(exc), site=site) from exc
         except Exception as exc:
             raise PlaywrightAdapterError(f"页面采集失败: {exc}", "request_failed", site=site) from exc
         finally:

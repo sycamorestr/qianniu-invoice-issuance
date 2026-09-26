@@ -183,6 +183,155 @@ class ControllerTests(unittest.TestCase):
             with self.subTest(open_missing=open_missing):
                 self._assert_missing_endpoint_never_launches_browser(open_missing)
 
+    def test_job_lock_defaults_to_no_wait_and_never_starts_runtime_when_busy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            instance = controller.PlaywrightBrowserController({**CONFIG, "user_data_dir": temp})
+            owner = controller.ProfileLock(Path(temp), "Default")
+            owner.acquire()
+            factory = Mock()
+            try:
+                with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}), \
+                        patch.object(controller.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+                    with self.assertRaises(controller.BrowserControllerError) as caught:
+                        asyncio.run(instance.start())
+                self.assertEqual(instance.lock_wait_ms, 0)
+                self.assertEqual(caught.exception.code, "profile_locked")
+                sleep.assert_not_awaited()
+                factory.assert_not_called()
+                self.assertIsNone(instance._profile_lock)
+                self.assertTrue(owner.owned)
+                self.assertTrue(owner.path.exists())
+            finally:
+                owner.release()
+
+    def test_real_job_mutex_release_allows_start_and_connect_without_new_browser(self):
+        for entrypoint in ("start", "connect"):
+            with self.subTest(entrypoint=entrypoint), tempfile.TemporaryDirectory() as temp:
+                instance = controller.PlaywrightBrowserController(
+                    {**CONFIG, "user_data_dir": temp}, lock_wait_ms=500)
+                owner = controller.ProfileLock(Path(temp), "Default")
+                owner.acquire()
+                context = FakeContext([FakePage(item["url"]) for item in CONFIG["browser_sessions"].values()])
+                browser = SimpleNamespace(contexts=[context], close=AsyncMock())
+                runtime = SimpleNamespace(stop=AsyncMock(), chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=browser)))
+                async def start_runtime():
+                    self.assertFalse(owner.owned)
+                    self.assertTrue(instance._profile_lock.owned)
+                    return runtime
+                factory = Mock(return_value=SimpleNamespace(start=AsyncMock(side_effect=start_runtime)))
+                process = {"pid": 99, "port": 9222, "profile_directory": "Default"}
+                async def exercise():
+                    asyncio.get_running_loop().call_later(0.025, owner.release)
+                    result = await getattr(instance, entrypoint)()
+                    await instance.close()
+                    return result
+                try:
+                    with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}), \
+                            patch.object(controller, "_cdp_version_sync", return_value={}) as endpoint, \
+                            patch.object(controller, "_running_profile_process", return_value=process), \
+                            patch.object(controller.subprocess, "Popen") as launch:
+                        result = asyncio.run(exercise())
+                    self.assertTrue(result["ok"])
+                    factory.assert_called_once()
+                    endpoint.assert_called_once()
+                    launch.assert_not_called()
+                    self.assertTrue(owner.path.exists())
+                    self.assertIsNone(instance._profile_lock)
+                finally:
+                    owner.release()
+
+    def test_job_lock_timeout_preserves_owner_and_never_contacts_browser(self):
+        for entrypoint in ("start", "connect"):
+            with self.subTest(entrypoint=entrypoint), tempfile.TemporaryDirectory() as temp:
+                instance = controller.PlaywrightBrowserController(
+                    {**CONFIG, "user_data_dir": temp}, lock_wait_ms=30)
+                owner = controller.ProfileLock(Path(temp), "Default")
+                owner.acquire()
+                metadata = owner.path.stat()
+                factory = Mock()
+                try:
+                    with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}), \
+                            patch.object(controller, "_cdp_version_sync") as endpoint, \
+                            patch.object(controller.subprocess, "Popen") as launch:
+                        with self.assertRaises(controller.BrowserControllerError) as caught:
+                            asyncio.run(getattr(instance, entrypoint)())
+                    self.assertEqual(caught.exception.code, "profile_locked")
+                    factory.assert_not_called()
+                    endpoint.assert_not_called()
+                    launch.assert_not_called()
+                    self.assertIsNone(instance._profile_lock)
+                    self.assertTrue(owner.owned)
+                    current = owner.path.stat()
+                    self.assertEqual((current.st_ino, current.st_size, current.st_mtime_ns),
+                                     (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns))
+                finally:
+                    owner.release()
+
+    def test_cancel_while_waiting_preserves_owner_and_releases_no_foreign_handle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            instance = controller.PlaywrightBrowserController(
+                {**CONFIG, "user_data_dir": temp}, lock_wait_ms=5_000)
+            owner = controller.ProfileLock(Path(temp), "Default")
+            owner.acquire()
+            metadata = owner.path.stat()
+            factory = Mock()
+            async def exercise():
+                task = asyncio.create_task(instance.connect())
+                await asyncio.sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            try:
+                with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}):
+                    asyncio.run(exercise())
+                factory.assert_not_called()
+                self.assertIsNone(instance._profile_lock)
+                self.assertTrue(owner.owned)
+                current = owner.path.stat()
+                self.assertEqual((current.st_ino, current.st_size, current.st_mtime_ns),
+                                 (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns))
+            finally:
+                owner.release()
+            owner.acquire()
+            owner.release()
+
+    def test_cancel_during_runtime_start_releases_acquired_job_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            instance = controller.PlaywrightBrowserController({**CONFIG, "user_data_dir": temp}, lock_wait_ms=5_000)
+            async def exercise():
+                entered = asyncio.Event()
+                async def start_runtime():
+                    entered.set()
+                    await asyncio.Event().wait()
+                factory = Mock(return_value=SimpleNamespace(start=AsyncMock(side_effect=start_runtime)))
+                with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}):
+                    task = asyncio.create_task(instance.start())
+                    await entered.wait()
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+            asyncio.run(exercise())
+            self.assertIsNone(instance._profile_lock)
+            successor = controller.ProfileLock(Path(temp), "Default")
+            successor.acquire()
+            successor.release()
+            self.assertTrue(successor.path.exists())
+
+    def test_lock_wait_never_retries_errors_without_real_mutex_busy_cause(self):
+        for code in ("profile_locked", "context_changed", "login_required"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temp:
+                instance = controller.PlaywrightBrowserController({**CONFIG, "user_data_dir": temp}, lock_wait_ms=5_000)
+                factory = Mock()
+                with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}), \
+                        patch.object(controller.ProfileLock, "acquire", side_effect=controller.BrowserControllerError("unrelated", code)) as acquire, \
+                        patch.object(controller.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+                    with self.assertRaises(controller.BrowserControllerError) as caught:
+                        asyncio.run(instance.start())
+                self.assertEqual(caught.exception.code, code)
+                acquire.assert_called_once()
+                sleep.assert_not_awaited()
+                factory.assert_not_called()
+
     def _assert_missing_endpoint_never_launches_browser(self, open_missing):
         with tempfile.TemporaryDirectory() as temp:
             config = {**CONFIG, "user_data_dir": temp}
@@ -242,6 +391,68 @@ class ControllerTests(unittest.TestCase):
             context.new_page.assert_not_awaited()
             self.assertFalse(blank.closed)
             terminate.assert_not_awaited()
+
+    def test_start_reuses_correct_existing_edge_without_spawning_or_duplicate_tabs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = {**CONFIG, "user_data_dir": temp}
+            instance = controller.PlaywrightBrowserController(config)
+            pages = [FakePage(item["url"]) for item in CONFIG["browser_sessions"].values()]
+            context = FakeContext(pages)
+            context.new_page = AsyncMock()
+            browser = SimpleNamespace(contexts=[context], close=AsyncMock())
+            runtime = SimpleNamespace(stop=AsyncMock(), chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=browser)))
+            factory = Mock(return_value=SimpleNamespace(start=AsyncMock(return_value=runtime)))
+            process = {"pid": 99, "port": 9222, "profile_directory": "Default"}
+            async def run():
+                value = await instance.start(open_missing=True)
+                await instance.close()
+                return value
+            with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}), \
+                    patch.object(controller, "_cdp_version_sync", return_value={}), \
+                    patch.object(controller, "_running_profile_process", return_value=process), \
+                    patch.object(controller.subprocess, "Popen") as launch:
+                value = asyncio.run(run())
+            self.assertTrue(value["ok"])
+            self.assertEqual(set(value["roles"]), set(CONFIG["browser_sessions"]))
+            launch.assert_not_called()
+            context.new_page.assert_not_awaited()
+            runtime.chromium.connect_over_cdp.assert_awaited_once()
+            self.assertTrue(all(not page.closed for page in pages))
+            self.assertIsNone(instance._profile_lock)
+
+    def test_start_does_not_launch_over_existing_wrong_port_or_unavailable_cdp(self):
+        for port, expected_code in ((9999, "profile_locked"), (9222, "browser_disconnected")):
+            with self.subTest(port=port), tempfile.TemporaryDirectory() as temp:
+                instance = controller.PlaywrightBrowserController({**CONFIG, "user_data_dir": temp}, lock_wait_ms=5_000)
+                runtime = SimpleNamespace(stop=AsyncMock())
+                factory = Mock(return_value=SimpleNamespace(start=AsyncMock(return_value=runtime)))
+                process = {"pid": 99, "port": port, "profile_directory": "Default"}
+                with patch.dict(sys.modules, {"playwright.async_api": SimpleNamespace(async_playwright=factory)}), \
+                        patch.object(controller, "_cdp_version_sync", return_value=None), \
+                        patch.object(controller, "_running_profile_process", return_value=process) as profile_process, \
+                        patch.object(controller.subprocess, "Popen") as launch:
+                    with self.assertRaises(controller.BrowserControllerError) as error:
+                        asyncio.run(instance.start(open_missing=True))
+                self.assertEqual(error.exception.code, expected_code)
+                profile_process.assert_called_once()
+                launch.assert_not_called()
+                self.assertIsNone(instance._profile_lock)
+
+    def test_home_role_matches_home_redirect_without_claiming_invoice_or_order_tabs(self):
+        home = "https://myseller.taobao.com/"
+        for path in ("", "home.htm", "home.htm/QnworkbenchHome/"):
+            self.assertTrue(controller._same_role_page(home + path, home))
+        for role in ("invoice", "orders"):
+            self.assertFalse(controller._same_role_page(CONFIG["browser_sessions"][role]["url"], home))
+        config = {**CONFIG, "browser_sessions": {"home": {"url": home}}}
+        page = FakePage(home + "home.htm/QnworkbenchHome/")
+        instance = controller.PlaywrightBrowserController(config)
+        instance.context = FakeContext([page])
+        instance.context.new_page = AsyncMock()
+        result = asyncio.run(instance.connect())
+        self.assertEqual(set(result["roles"]), {"home"})
+        self.assertIs(instance.page("home"), page)
+        instance.context.new_page.assert_not_awaited()
 
     def test_cold_start_waits_for_native_tabs_without_creating_or_closing(self):
         config = dict(CONFIG)
@@ -349,8 +560,9 @@ class ControllerTests(unittest.TestCase):
     def test_config_accepts_role_subsets_and_rejects_empty_or_unknown_roles(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "browser.json"
-            for roles in (("invoice", "orders"), ("goods",), controller.ROLE_NAMES):
-                value = {**CONFIG, "browser_sessions": {role: CONFIG["browser_sessions"][role] for role in roles}}
+            supported = {**CONFIG["browser_sessions"], "home": {"url": "https://myseller.taobao.com/"}}
+            for roles in (("invoice", "orders"), ("goods",), ("home",), controller.ROLE_NAMES):
+                value = {**CONFIG, "browser_sessions": {role: supported[role] for role in roles}}
                 path.write_text(json.dumps(value), encoding="utf-8")
                 loaded, _ = controller.load_browser_config(path)
                 self.assertEqual(set(controller.role_specs(loaded)), set(roles))
@@ -400,7 +612,7 @@ class ControllerTests(unittest.TestCase):
         instance = controller.PlaywrightBrowserController(config)
         instance.context = FakeContext(pages)
         result = asyncio.run(instance.register_roles(open_missing=False))
-        self.assertEqual(set(result["roles"]), set(controller.ROLE_NAMES))
+        self.assertEqual(set(result["roles"]), set(CONFIG["browser_sessions"]))
         self.assertFalse(any(item.created for item in instance.registrations.values()))
 
     def test_connect_recovers_only_missing_orders_page_and_reuses_others(self):
@@ -428,7 +640,7 @@ class ControllerTests(unittest.TestCase):
         instance.context.new_page = AsyncMock()
         result = asyncio.run(instance.connect(open_missing=True))
         self.assertFalse(any(item["created"] for item in result["roles"].values()))
-        self.assertEqual([instance.page(role) for role in controller.ROLE_NAMES], pages)
+        self.assertEqual([instance.page(role) for role in CONFIG["browser_sessions"]], pages)
         instance.context.new_page.assert_not_awaited()
 
     def test_default_connect_does_not_recover_missing_pages(self):

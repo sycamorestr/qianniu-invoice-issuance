@@ -4,15 +4,41 @@ import assert from 'node:assert/strict';
 const qianniu=await fs.readFile(new URL('./read_qianniu.js',import.meta.url),'utf8');
 const jst=await fs.readFile(new URL('./query_jst_invoice_goods.js',import.meta.url),'utf8');
 const detail=await fs.readFile(new URL('./read_order_detail.js',import.meta.url),'utf8');
+const contextSource=await fs.readFile(new URL('./playwright_context_qianniu.js',import.meta.url),'utf8');
 const base={URL,URLSearchParams,TextDecoder,Uint8Array,AbortSignal,AbortController,setTimeout,clearTimeout,btoa};
 const response=(body,opts={})=>({ok:opts.ok===undefined?true:opts.ok,status:opts.status===undefined?200:opts.status,url:opts.url||'https://business.example/read',json:async()=>body,
   text:async()=>JSON.stringify(body),arrayBuffer:async()=>new TextEncoder().encode(JSON.stringify(body)).buffer,
   headers:{get:()=> 'application/json; charset=utf-8'}});
+async function runContext(input, context={isLogin:true,realNick:'account:operator'}, shop={userNick:'account'}) {
+  return vm.runInNewContext(contextSource.replace('__INPUT__',JSON.stringify({agent_id:'0',...input})), {
+    ...base, document:{querySelector:()=>null}, performance:{getEntriesByType:()=>[]},
+    location:{href:'https://myseller.taobao.com/home.htm/merchant-invoice/'},
+    fetch:async url=>response({data:url.endsWith('/context')?context:shop})
+  });
+}
+const aliasContext=await runContext({expected_store:'Friendly shop',expected_account:'account:operator'});
+assert.equal(aliasContext.store,'Friendly shop');
+assert.equal(aliasContext.observed_store,'account');
+assert.equal(aliasContext.account_nick,'account:operator');
+await assert.rejects(()=>runContext({expected_store:'Friendly shop'}),/context_changed_store/);
+await assert.rejects(()=>runContext({expected_store:'account',expected_account:'other:operator'}),/context_changed_account/);
+await assert.rejects(()=>runContext({expected_account:'account:operator'},{isLogin:true}),/context_missing_account/);
+await assert.rejects(()=>runContext({expected_account:'account:operator',expected_observed_store:'other'}),/context_changed_store/);
+await assert.rejects(()=>runContext({expected_account_nick:'other:operator'}),/context_changed_account/);
+await assert.rejects(()=>runContext({}, {isLogin:false}),/login_required/);
+assert.equal((await runContext({expected_store:'account'})).store,'account');
 async function run(input,bodies,location={hostname:'myseller.taobao.com',pathname:'/home.htm/merchant-invoice/'},fetchOverride=null){
   let at=0;
   return await vm.runInNewContext(qianniu.replace('__INPUT__',JSON.stringify(input)),{...base,location,fetch:fetchOverride||(async()=>response(bodies[at++]))});
 }
 const apps={operation:'applications',date:'2026-01-01',agentId:'0'};
+const emptyExport=await run({...apps,operation:'export'},[],undefined,async()=>({ok:true,status:200,url:'https://einvoice.taobao.com/export',arrayBuffer:async()=>new ArrayBuffer(0)}));
+assert.equal(emptyExport.base64,'');
+assert.equal(emptyExport.status,200);
+assert.equal((await run(apps,[{code:200,total:0,message:'无数据'}])).total,0);
+await assert.rejects(()=>run(apps,[{code:1004,message:'权限不足'}]),/permission_required/);
+await assert.rejects(()=>run(apps,[{code:200,total:1,message:'无数据'}]),/invalid_application_response/);
+await assert.rejects(()=>run(apps,[{code:500,total:0}]),/invalid_application_response/);
 const a={serialNo:'A',tid:'O1',applyStatus:1},b={serialNo:'B',tid:'O2',applyStatus:1};
 const result=await run(apps,[{code:200,total:2,data:[a,b]}]);
 assert.equal(result.rows.length,2);assert.equal(result.total,2);assert.equal(result.api_total,2);

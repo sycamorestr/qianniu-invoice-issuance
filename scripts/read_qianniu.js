@@ -42,7 +42,9 @@
     if(operation==='export'){
       const response=await request('https://einvoice.taobao.com/api/invoice/batch4visitor/apply?'+new URLSearchParams({...common,pageNo:'0',pageSize:'20'}));
       const bytes=new Uint8Array(await response.arrayBuffer());
-      if(bytes[0]!==80||bytes[1]!==75)throw Error('not_xlsx');
+      // A zero-byte HTTP success is the platform's no-data export. Preserve
+      // those bytes; the runner must corroborate an explicitly empty list.
+      if(bytes.length&&(bytes[0]!==80||bytes[1]!==75))throw Error('not_xlsx');
       let binary='';for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));
       // Keep the browser-session URL out of the saved checkpoint. The local
       // bridge persists only the XLSX bytes and their file hash.
@@ -58,6 +60,11 @@
     for(let pageNo=0;pageNo<10000;pageNo++){
       const response=await request('https://einvoice.taobao.com/api/qianniu/invoice/list/apply?'+new URLSearchParams({...common,applyListType:'0',pageSize:'20',pageNo:String(pageNo)}));
       const body=await response.json();
+      if(body.code===1004)throw Error('permission_required');
+      // With no applications the live API returns {code:200,total:0,
+      // message:'无数据'} without data. Only this explicit zero is empty;
+      // missing rows for a nonzero total remain a failed response.
+      if(body.code===200&&body.total===0&&body.data==null)body.data=[];
       if(body.code!==200||!Array.isArray(body.data)||!Number.isInteger(body.total))throw Error('invalid_application_response');
       if(api_total!==null&&api_total!==body.total)throw Error('applications_changed_during_pagination');
       api_total=body.total;

@@ -6,18 +6,33 @@ import csv
 import io
 import json
 import sys
+import time
 import uuid
 from datetime import date as calendar_date, datetime
 from decimal import Decimal
 from pathlib import Path
 
 from browser_lock import FileMutex, FileMutexBusy
-from run_online import OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json, utc_now
+from run_online import OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json, utc_now, stable_sha256
 from shop_registry import load_registry
 
 SUCCESS = {'complete', 'no_applications', 'all_excluded', 'all_blocked', 'plan_only'}
-SHOP_FAILURES = {'auth_required', 'login_required', 'context_changed', 'context_mismatch',
-                 'context_missing', 'page_missing', 'browser_disconnected', 'profile_locked'}
+SHOP_FAILURES = {'auth_required', 'login_required', 'permission_required', 'context_changed', 'context_mismatch',
+                 'context_missing', 'page_missing', 'browser_disconnected', 'profile_locked',
+                 'browser_launch_failed', 'browser_identity_unverified'}
+
+
+def selected_identity(registry: dict, ids: list[str]) -> str:
+    """Freeze this batch, allowing later additions to the workbench catalog."""
+    available = {shop['id']: shop for shop in registry['shops']}
+    if not ids or len(set(ids)) != len(ids) or set(ids) - available.keys():
+        raise OnlineError('批次选中店铺缺失或重复', 'resume_mismatch')
+    return stable_sha256({
+        'issuer': registry['issuer'], 'jst_browser_config': registry['jst_browser_config'],
+        'shared_identity_sha256': registry['shared_identity_sha256'],
+        'shops': [{key: available[sid][key] for key in
+                   ('id', 'store', 'browser_config', 'browser_identity_sha256')} for sid in ids],
+    })
 
 
 def publish(path: Path, content: bytes):
@@ -34,15 +49,19 @@ class BatchRunner:
     def __init__(self, *, registry: Path, date: str | None = None, output_root: Path | None = None,
                  resume: Path | None = None, shops: list[str] | None = None,
                  node: str | None = None, node_modules: str | None = None,
-                 plan_only: bool = False, runner_factory=OnlineRunner):
+                 plan_only: bool = False, connect_only: bool = False, runner_factory=OnlineRunner):
         self.registry = load_registry(registry)
         self.node, self.node_modules = node, node_modules
         self.runner_factory = runner_factory
+        self.connect_only = connect_only
         if resume:
             self.run_dir = resume.resolve()
             self.state = read_json(self.run_dir / 'batch-state.json')
-            if (self.state.get('version') != 1 or
-                    self.state['registry_identity_sha256'] != self.registry['identity_sha256'] or
+            version = self.state.get('version')
+            current_identity = (selected_identity(self.registry, self.state.get('selected_shop_ids', []))
+                                if version == 2 else self.registry['identity_sha256'])
+            if (version not in {1, 2} or
+                    self.state['registry_identity_sha256'] != current_identity or
                     (date and date != self.state['date']) or
                     (shops is not None and shops != self.state['selected_shop_ids'])):
                 raise OnlineError('批次日期、店铺或浏览器配置已变化', 'resume_mismatch')
@@ -59,6 +78,13 @@ class BatchRunner:
                         any(saved.get(key) != expected[key] for key in ('id', 'store', 'browser_config')) or
                         saved.get('run_dir') != str(self.run_dir / 'shops' / sid)):
                     raise OnlineError('批次店铺身份或输出目录与清单不符', 'resume_mismatch')
+                if ('login_username' in saved and
+                        saved['login_username'] != expected.get('login_username', '')):
+                    raise OnlineError('批次店铺登录账号配置已变化', 'resume_mismatch')
+                # Legacy batches had no account-label binding. It may be
+                # supplied before first collection; OnlineRunner separately
+                # rejects changes after an account context was committed.
+                saved.setdefault('login_username', expected.get('login_username', ''))
             self.node = node or self.state.get('node')
             self.node_modules = node_modules or self.state.get('node_modules')
             if plan_only and not self.state['plan_only']:
@@ -74,9 +100,9 @@ class BatchRunner:
             root = (output_root or Path(self.registry['output_root'])).resolve()
             self.run_dir = root / f'batch-{date}-{datetime.now():%Y%m%d-%H%M%S-%f}'
             self.run_dir.mkdir(parents=True, exist_ok=False)
-            self.state = {'version': 1, 'date': date, 'status': 'created', 'created_at': utc_now(),
+            self.state = {'version': 2, 'date': date, 'status': 'created', 'created_at': utc_now(),
                           'registry_path': self.registry['path'],
-                          'registry_identity_sha256': self.registry['identity_sha256'],
+                          'registry_identity_sha256': selected_identity(self.registry, selected),
                           'selected_shop_ids': selected, 'plan_only': plan_only,
                           'node': node, 'node_modules': node_modules,
                           'shops': [{**available[sid], 'status': 'pending', 'attempts': [],
@@ -86,7 +112,8 @@ class BatchRunner:
     def save(self):
         publish_json(self.run_dir / 'batch-state.json', self.state)
         rows = [{key: shop.get(key) for key in ('id', 'store', 'status', 'ready_count', 'ready_amount',
-                    'blocked_count', 'blocked_amount', 'excluded_count', 'error_code', 'error_site',
+                    'blocked_count', 'blocked_amount', 'excluded_count', 'excluded_amount',
+                    'elapsed_seconds', 'error_code', 'error_site', 'error', 'recovery_action',
                     'common_template', 'tax_template', 'exceptions', 'run_manifest')}
                 for shop in self.state['shops']]
         totals = {}
@@ -118,8 +145,20 @@ class BatchRunner:
                 paths.add(Path(item['path']))
         generated = Path(state['generated_dir'])
         paths.update(generated / name for name in ('run.json', 'exceptions.csv'))
-        paths.add(generated / ('qianniu_common_' + state['date'] + '.xlsx'))
-        if read_json(generated / 'run.json').get('status') == 'complete':
+        manifest = read_json(generated / 'run.json')
+        common = generated / ('qianniu_common_' + state['date'] + '.xlsx')
+        if common.is_file():
+            paths.add(common)
+        elif manifest.get('status') == 'no_applications' and manifest.get('empty_export'):
+            empty = manifest['empty_export']
+            evidence = Path(empty['path'])
+            if (not evidence.is_file() or evidence.stat().st_size != 0 or
+                    file_sha256(evidence) != empty['sha256']):
+                raise OnlineError('无申请导出证据缺失或变化', 'checkpoint_invalid')
+            paths.add(evidence)
+        else:
+            raise OnlineError('成功店铺缺少原始通用模板或已验证空导出证据', 'checkpoint_invalid')
+        if manifest.get('status') == 'complete':
             paths.add(generated / ('qianniu_invoice_tax_template_' + state['date'] + '.xlsx'))
         return [{'path': str(path), 'sha256': file_sha256(path)} for path in sorted(paths)]
 
@@ -151,6 +190,7 @@ class BatchRunner:
                 if child_dir.parent != self.run_dir / 'shops' or child_dir.name != shop['id']:
                     raise OnlineError('店铺输出目录不属于此批次', 'checkpoint_invalid')
                 attempt = {'started_at': utc_now(), 'status': 'running'}
+                attempt_started = time.perf_counter()
                 shop['attempts'].append(attempt)
                 shop['status'] = 'running'
                 self.save()
@@ -159,7 +199,10 @@ class BatchRunner:
                     kwargs = dict(date=self.state['date'], store=shop['store'], issuer=self.registry['issuer'],
                                   output_root=self.run_dir / 'shops', browser_config=Path(shop['browser_config']),
                                   jst_browser_config=Path(self.registry['jst_browser_config']),
-                                  node=self.node, node_modules=self.node_modules, plan_only=self.state['plan_only'])
+                                  node=self.node, node_modules=self.node_modules, plan_only=self.state['plan_only'],
+                                  connect_only=self.connect_only)
+                    if shop.get('login_username'):
+                        kwargs['expected_account'] = shop['login_username']
                     if (child_dir / 'run-state.json').exists():
                         kwargs['resume'] = child_dir
                     else:
@@ -173,20 +216,32 @@ class BatchRunner:
                         raise OnlineError('单店回执终态不一致', 'checkpoint_invalid')
                     shop.update({key: result.get(key) for key in ('status', 'ready_count', 'ready_amount',
                                  'blocked_count', 'blocked_amount', 'excluded_count', 'excluded_amount')})
-                    shop.update(common_template=str(generated / f"qianniu_common_{self.state['date']}.xlsx"),
+                    common = generated / f"qianniu_common_{self.state['date']}.xlsx"
+                    shop.update(common_template=str(common) if common.is_file() else None,
                                 tax_template=manifest.get('output'), exceptions=str(generated / 'exceptions.csv'),
                                 run_manifest=str(generated / 'run.json'), proof=self.proof(child_dir))
                     shop.pop('error_code', None); shop.pop('error_site', None); shop.pop('error', None)
+                    shop.pop('recovery_action', None)
                     attempt.update(status=shop['status'], finished_at=utc_now())
                 except Exception as exc:
                     code, site = getattr(exc, 'code', 'failed'), getattr(exc, 'site', None)
                     shop.update(status='failed', error_code=code, error_site=site, error=str(exc))
+                    shop['recovery_action'] = (
+                        '由主账号为此子账号分配发票列表查看权限后恢复此批次' if site == 'qianniu' and code == 'permission_required' else
+                        '在共享票聚窗口完成人工登录后恢复此批次' if site == 'jst' and code in {'auth_required', 'login_required'} else
+                        '在此店铺原浏览器窗口完成人工登录后恢复此批次' if site == 'qianniu' and code in {'auth_required', 'login_required'} else
+                        '待正在使用此环境的任务结束后恢复此批次' if code == 'profile_locked' else
+                        '根据错误修复原环境或配置后恢复此批次，不重复采集已完成店铺')
                     attempt.update(status='failed', error_code=code, error_site=site, finished_at=utc_now())
                     # A shared failure affects every remaining shop. Stop once;
                     # never issue the same bad login/query nine times.
                     if site != 'qianniu' or code not in SHOP_FAILURES:
                         self.state['status'] = 'stopped'
-                        return self.save()
+                finally:
+                    shop['elapsed_seconds'] = attempt['elapsed_seconds'] = round(time.perf_counter() - attempt_started, 3)
+                if self.state['status'] == 'stopped':
+                    self.state['finished_at'] = utc_now()
+                    return self.save()
                 self.save()
             self.state['status'] = ('partial' if any(s['status'] == 'failed' for s in self.state['shops']) else 'complete')
             self.state['finished_at'] = utc_now()
@@ -208,6 +263,8 @@ def main(argv=None):
     parser.add_argument('--output-root', type=Path)
     parser.add_argument('--node'); parser.add_argument('--node-modules')
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--connect-only', action='store_true',
+                        help='仅连接已运行浏览器；默认按需启动本批次所需的原有环境')
     args = parser.parse_args(argv)
     try:
         result = BatchRunner(**vars(args)).run()

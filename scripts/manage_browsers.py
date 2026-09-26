@@ -9,6 +9,7 @@ import socket
 import sys
 from pathlib import Path
 
+from invoice_browser_config import with_invoice_pages
 from playwright_controller import PlaywrightBrowserController, BrowserControllerError, load_browser_config
 from run_online import OnlineError, atomic_json
 from shop_registry import load_registry
@@ -54,7 +55,7 @@ def initialize(root: Path, shops_file: Path, issuer: str | None):
                       **({'login_username': str(shop['login_username'])} if shop.get('login_username') else {})})
     registry_path = root / 'shops.json'
     if registry_path.exists():
-        existing = load_registry(registry_path, require_issuer=False)
+        existing = load_registry(registry_path, require_issuer=False, include_workbench=False)
         if ([(s['id'], s['store']) for s in existing['shops']] != [(s['id'], s['store']) for s in clean]
                 or (issuer is not None and existing['issuer'] != issuer)):
             raise OnlineError('已有清单不同，拒绝覆盖浏览器环境', 'configuration')
@@ -79,7 +80,7 @@ def initialize(root: Path, shops_file: Path, issuer: str | None):
         'output_root': 'outputs',
         'shops': [{**shop, 'browser_config': f"config/{shop['id']}.json"} for shop in clean],
     })
-    load_registry(registry_path, require_issuer=False)
+    load_registry(registry_path, require_issuer=False, include_workbench=False)
     return {'status': 'initialized', 'registry': str(registry_path), 'shops': len(clean),
             'browser_environments': len(clean) + 1}
 
@@ -96,6 +97,10 @@ async def manage(registry_path: Path, command: str, targets: list[str] | None,
     for target in selected:
         choice = choices[target]
         config, _ = load_browser_config(choice['config'])
+        try:
+            config = with_invoice_pages(config)
+        except ValueError as exc:
+            raise OnlineError(str(exc), 'configuration') from exc
         controller = PlaywrightBrowserController(config, timeout_ms=timeout)
         print(f"{command}: {target} {choice['name']}", file=sys.stderr, flush=True)
         try:

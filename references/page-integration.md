@@ -11,7 +11,7 @@
 | `goods` | `https://fp.erp321.com/setting/goodsManage` |
 | 票聚商品 iframe | `https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index` |
 
-`playwright_adapter.py` 在一个后台事件循环中复用控制器。三个角色既可在同一浏览器，也可分为千牛 `invoice/orders` 与共享票聚 `goods` 两个浏览器；脚本依据 site 进入对应页面上下文。日常 `connect(open_missing=True)` 连接已经运行的专用 Edge，先复用页面，再仅按各自配置的角色 URL 补齐缺页一次，不误开另一站；不会启动浏览器进程。生命周期和故障边界见[浏览器控制](playwright-browser.md)。
+`playwright_adapter.py` 在一个后台事件循环中复用控制器。三个角色既可在同一浏览器，也可分为千牛 `invoice/orders` 与共享票聚 `goods` 两个浏览器；脚本依据 site 进入对应页面上下文。日常默认复用已有专用 Edge；确认未运行时，按原 Profile 和固定非零端口启动一次。随后先复用页面，再仅按各自配置的角色 URL 补齐缺页一次，不误开另一站。`--connect-only` 使用 `connect(open_missing=True)`，禁止启动浏览器进程。生命周期和故障边界见[浏览器控制](playwright-browser.md)。
 
 `playwright_context_qianniu.js` 通过 `/api/context`、`/api/shops` 核对当前千牛登录与店铺。票聚外层页面提供公司显示名称，`playwright_context_jst.js` 从当前商品 iframe 资源记录提取 `coid`、`uid`。公司名和带操作员的标签分别保存，`agentId` 取当前页面运行时或已核对的主体接口值。页面存在、URL 无 login 均不能代替身份核验。
 
@@ -29,7 +29,7 @@ GET https://einvoice.taobao.com/api/qianniu/invoice/list/apply
 &startTime=YYYY-MM-DD&endTime=YYYY-MM-DD&pageNo=0
 ```
 
-响应要求 `code=200`，数据在 `data`，页码从 0 开始。读取完整分页，流水号唯一，分页中服务端 total 必须稳定。字段包括 `serialNo`、`tid`、`amount`、`applyStatus`、`applyTime`。服务端 total 与实际观察行数可能不同，因此分别记录 `api_total` 和 `observed_total`。
+响应要求 `code=200`，数据在 `data`，页码从 0 开始；平台明确返回 `total=0` 的无数据响应可缺少 `data`，规范为 `rows=[]` 及零计数。读取完整分页，流水号唯一，分页中服务端 total 必须稳定。字段包括 `serialNo`、`tid`、`amount`、`applyStatus`、`applyTime`。服务端 total 与实际观察行数可能不同，因此分别记录 `api_total` 和 `observed_total`。
 
 申请列表只用于诊断和订单关联。`applyStatus`、页面“已准”等状态不能改变导出原件定义的选择范围。标准任务按单日运行，不继承页面上残留的买家、订单等筛选。
 
@@ -42,9 +42,9 @@ GET https://einvoice.taobao.com/api/invoice/batch4visitor/apply
 ?startTime=YYYY-MM-DD&endTime=YYYY-MM-DD&pageNo=0&pageSize=20&agentId=<本次值>
 ```
 
-该接口具有页面“全选后导出通用模板”的全量语义，无需操作搜索、全选或下载按钮。页面脚本直接读取响应二进制，经 Base64 传给本地编排器，解码保存为 `qianniu_common.xlsx`。没有额外的下载 URL 捕获或浏览器外会话重放步骤。
+该接口具有页面“全选后导出通用模板”的全量语义，无需操作搜索、全选或下载按钮。页面脚本直接读取响应二进制，经 Base64 传给本地编排器，解码保存为不可变 `common-export.bin`；非空通过 ZIP 校验后原字节复制为 `qianniu_common.xlsx`。没有额外的下载 URL 捕获或浏览器外会话重放步骤。
 
-响应须通过 HTTP、登录跳转、ZIP 文件头、工作表和必要字段检查。数据以事务检查点发布，规则见[原子发布和恢复](input-output-contract.md#原子发布和恢复)。原始 XLSX 必须保留全部源行及顺序。
+响应须通过 HTTP、登录跳转检查，非空内容还须通过 ZIP 文件头、工作表和必要字段检查。只有本次申请快照已明确为空，且实际导出 HTTP 成功、响应为零字节时，才以保留空响应证据的 `no_applications` 正常结束；此时可没有 Content-Type，不生成 XLSX。列表为零仍需执行导出，若得到非空通用模板则以其为准。数据以事务检查点发布，恢复不重复已成功导出，规则见[原子发布和恢复](input-output-contract.md#原子发布和恢复)。原始 XLSX 必须保留全部源行及顺序。
 
 只有通用模板决定范围：优先“开票状态”，为空才回退“申请状态”，精确为“待处理”的源行进入生成。其他状态保留在原件中，不查询其订单或写入税局模板。
 
