@@ -1,91 +1,131 @@
 # 千牛税局模板生成 Skill
 
-按申请日期导出千牛通用模板，批量查询订单商品编码和聚水潭票聚商品信息，生成税局导入表格及异常清单。支持一张发票多个商品、折扣行匹配和逐票校验。
+按申请日期导出千牛通用模板，关联订单商品编码和聚水潭票聚开票资料，生成经过校验的税局导入表格、异常清单及原始通用模板副本。只生成文件，不提交实际开票。
 
-本项目生成表格，不提交实际开具发票。
+浏览器使用原生 Edge 保存登录态，Playwright 通过 CDP 连接并复用三个业务页面。采集脚本在页面内调用接口，本地 Python 应用业务规则，Artifact Tool 填写工作簿。日常任务结束后浏览器继续运行。
 
-## 安装
+## 安装与依赖
 
-建议使用 Windows 和 Codex 桌面端。将整个仓库放到 Codex 的技能目录，默认位置为：
-
-```text
-%USERPROFILE%\.codex\skills\qianniu-invoice-issuance
-```
-
-如果设置了 `CODEX_HOME`，使用其下的 `skills/qianniu-invoice-issuance`。可以下载 ZIP 后解压，也可以克隆：
+推荐 Windows + Codex 桌面端。将仓库克隆到技能目录；设置了 `CODEX_HOME` 时，改用其下的 `skills` 目录：
 
 ```powershell
-git clone https://github.com/sycamorestr/qianniu-invoice-issuance.git "$env:USERPROFILE/.codex/skills/qianniu-invoice-issuance"
+$skill = Join-Path $env:USERPROFILE '.codex/skills/qianniu-invoice-issuance'
+git clone https://github.com/sycamorestr/qianniu-invoice-issuance.git $skill
 ```
 
-复制时保留 `assets`，内置 V260401 空白税局模板，无需另行提供模板。安装后在新一轮对话中调用：
+仓库包含 V260401 空白税局模板，请保留 `assets`。不需要 Microsoft Excel。
+
+| 依赖 | 用途 | 已验证版本 |
+| --- | --- | --- |
+| Python | 编排、业务规则、校验 | 3.13 |
+| Playwright Python | 连接本机 Edge | 1.63.0 |
+| lxml | 保护原始 XLSX XML 结构 | 6.1.1 |
+| Node.js | 执行工作簿作者程序与 JS 测试 | 24.19.0 |
+| Codex bundled Artifact Tool | 写入 XLSX | 当前 Codex 配套环境 |
+| Microsoft Edge | 保存会话、运行页面接口 | 本机已安装版本 |
+
+推荐 Python 3.13 或更新版本；表中是已验证组合，不是所有版本的兼容性承诺。优先复用已有解释器：
+
+```powershell
+$python = (Get-Command python).Source
+& $python -m pip install -r "$skill/requirements.txt"
+& $python -c 'import playwright, lxml; print("Python dependencies ready")'
+```
+
+连接已有 Edge 不需要执行 `playwright install` 下载另一套浏览器。
+
+**Artifact Tool 必须由当前 Codex 环境提供，不随仓库分发，也不假设能通过普通 npm 安装。** 让 Codex 调用 `load_workspace_dependencies`，将返回的 Node 可执行文件和包含 `@oai/artifact-tool` 的 `node_modules` 路径分别作为 `$node`、`$nodeModules`。没有该依赖可以运行规则测试和 `--plan-only`，不能生成最终税局 XLSX。
+
+## 首次准备浏览器
+
+配置与业务输出放在技能目录之外。以下为 PowerShell 示例，`$work` 可改为自己的工作目录：
+
+```powershell
+$work = Join-Path $env:USERPROFILE 'qianniu-invoice-work'
+$config = Join-Path $work 'browser-config.json'
+New-Item -ItemType Directory -Path $work -Force | Out-Null
+if (-not (Test-Path -LiteralPath $config)) {
+  Copy-Item "$skill/assets/browser-config.example.json" $config
+}
+& $python "$skill/scripts/playwright_controller.py" --config $config start
+```
+
+示例配置中的相对路径以配置文件所在目录为基准。它会为专用 Edge 保存独立用户数据，不使用日常浏览器的数据目录。可设置 `executable_path` 指定浏览器程序。
+
+首次启动后，在千牛和票聚完成人工登录，并确认是本次店铺和开票主体。登录页可能使启动命令报告 `login_required`；浏览器会保留，完成登录后即可运行日常命令。登录信息保存在本机用户数据目录，后续通常直接复用；会话过期或验证码仍需人工处理。
+
+## 日常执行
+
+保持专用 Edge 运行，让 Codex 执行：
 
 ```text
-使用 $qianniu-invoice-issuance，先检查依赖和浏览器连接，
-然后按指定申请日期生成税局模板表格和异常清单。
+使用 $qianniu-invoice-issuance，按指定申请日期、店铺和开票主体生成税局模板，
+同时交付原始通用模板与异常清单。
 ```
 
-## 依赖
+或在上述变量已配置的 PowerShell 中运行：
 
-| 组件 | 作用 | 已验证版本 |
-| --- | --- | --- |
-| Python | 数据处理和校验 | 3.12.14 |
-| lxml | 保留模板原生 XML 结构 | 6.1.1 |
-| Node.js | 执行表格生成及测试 | 24.19.0 |
-| @oai/artifact-tool | 生成 XLSX | 2.8.59 |
-| PowerShell | 页面采集桥接 | 7.6.5 |
-| OpenCLI 与浏览器扩展 | 连接已登录业务页面 | OpenCLI 1.8.6 |
+```powershell
+& $python "$skill/scripts/run_online.py" `
+  --date '2026-01-01' `
+  --store '示例店铺' `
+  --issuer '示例开票公司' `
+  --browser-config $config `
+  --output-root "$work/outputs" `
+  --node $node --node-modules $nodeModules
+```
 
-以上是已验证组合，不是最低版本声明。Python、Node、Artifact Tool 优先使用 Codex 的 `load_workspace_dependencies` 提供的 bundled 环境。`requirements.txt` 仅声明 Python 第三方依赖，不包含 Node 依赖。
+日期、店铺、公司名称必须换为本次实际值。程序会核对当前登录主体，复用发票、订单、票聚三个页面；启动时缺少业务页会按配置 URL 补开一次。后续采集按订单最多 50 单一批、票聚最多 40 编码一个检查点和 8 路并发执行。只有缺失或歧义项需要补读订单详情。
 
-**Artifact Tool 不随仓库分发。** 首次使用需要确认同事的 Codex 环境能提供 `@oai/artifact-tool`。普通 Python 和 Node 安装本身不足以生成最终表格；没有该库时需先配置兼容环境。无需安装 Microsoft Excel。
+浏览器未运行时，先使用首次准备中的 `start` 命令。登录失效、验证码、主体不符或连接失败时，程序保留进度并停止，避免重复尝试。
 
-使用现有 PowerShell 桥接时，需要 OpenCLI 和相应浏览器扩展。CLI 可通过 `npm install -g @jackwener/opencli@1.8.6` 安装；浏览器扩展连接后运行 `opencli doctor` 检查。建议同时配备 `opencli-usage`、`opencli-browser` 和 Spreadsheets skill。其他浏览器工具可以执行同样的只读页面脚本，但应单独验证连接方式。
+## 恢复与离线复核
 
-每位使用者在自己的浏览器登录千牛和票聚，并具备申请导出、订单查看和商品查询权限。登录态、Cookie、令牌不放进仓库。
+修复登录或环境问题后，用原作业目录恢复。不要编辑原始检查点：
 
-## 业务规则
+```powershell
+& $python "$skill/scripts/run_online.py" `
+  --resume "$work/outputs/原作业目录" `
+  --node $node --node-modules $nodeModules
+```
 
-- 申请流水号为发票主键，基本信息每票一行，商品明细逐行重复流水号。
-- 金额、数量和折扣取千牛通用模板；订单金额仅用于匹配核对。
-- 票聚商品类型、商品状态均不限；商品编码精确匹配且明确允许开票。
-- 规格取“颜色及规格”，明确零税率输出空白，单价留空。
-- “是否展示购买方地址电话银行账号”留空，地址、电话、银行和账号字段正常填写。
-- 四张可见业务表保留，第三、四表数据区为空；隐藏字典、格式和校验保留。
-- 价外费用等未定义映射整票暂缓，进入异常清单。
+恢复会重新核对两站主体和文件哈希，复用已成功批次。只想重做本地规则和表格时：
 
-完整规则见 [详细规则](references/detailed-rules.md)、[字段映射](references/flow-and-field-mapping.md)。
+```powershell
+& $python "$skill/scripts/run_online.py" `
+  --replay-input "$work/outputs/原作业目录" `
+  --output-root "$work/replays" `
+  --node $node --node-modules $nodeModules
+```
 
-## 运行和输出
+离线重放不访问浏览器，也不代表当前线上状态。增加 `--plan-only` 可只检查计划、数量、金额和异常，不写税局 XLSX。旧后端作业不能直接在线恢复；已有业务快照仍可离线重放。
 
-浏览器采集由 Codex 在已核对的登录页面执行；本地入口 `scripts/run_invoice.py` 负责处理保存的采集快照。日期、店铺、主体、输入和输出目录均显式传入，默认模板相对 skill 目录定位；需要其他模板版本时可传 `--template`。
+## 交付与规则
 
-命令参数和采集文件结构见 [输入输出与运行](references/input-output-contract.md)，页面及接口记录见 [页面接入](references/page-integration.md)。
+完整成功后，作业的 `generated` 目录包含：
 
-最终交付：
+- `qianniu_invoice_tax_template_日期.xlsx`：可开票申请的税局导入表格。
+- `qianniu_common_日期.xlsx`：与页面导出原件字节一致，供人工核对。
+- `exceptions.csv`：暂缓与负数排除原因。
+- `run.json`：范围、数量、金额、输入哈希和校验结果。
 
-- `qianniu_invoice_tax_template_日期.xlsx`：通过校验的税局导入表格。
-- `exceptions.csv`：暂缓申请及具体原因。
-- `run.json`：范围、数量、金额、输入哈希和校验状态。
+通用模板中精确为“待处理”的源行定义范围；负总额整票排除。数量、商品金额和折扣取通用模板；价外费用只累加到同申请、同订单的唯一正商品。编码匹配必须唯一，票聚资料不完整则整票暂缓。规格取“颜色及规格”，明确零税率填写文本 `0`。原模板四张业务表、隐藏字典、样式及校验保留。
 
-没有申请或全部暂缓时，不生成可导入的发票数据文件。原始采集和中间文件留在本地作业目录，不在本仓库发布。
+无可生成申请时不输出可导入税局模板，仍保留原件副本、异常和报告。采集中途失败则保留已取得的原件与检查点；失败不能称为完整交付。
 
-## 验证
+完整业务规则见 [详细规则](references/detailed-rules.md) 和 [字段映射](references/flow-and-field-mapping.md)。实现与恢复契约见 [输入输出](references/input-output-contract.md)，浏览器生命周期见 [浏览器控制](references/playwright-browser.md)，接口说明见 [页面接入](references/page-integration.md)。
 
-在已配置的运行环境中执行：
+## 测试与边界
+
+在仓库根目录执行：
 
 ```powershell
 python scripts/test_build_invoice_plan.py
 python scripts/test_pipeline.py
+python -m unittest discover -s scripts -p 'test_*.py'
 node scripts/test_read_collectors.mjs
 ```
 
-当前包含 25 项计划测试、9 项管线测试及 8 项模拟采集检查。模拟检查不访问线上接口。内置模板已用于历史快照完整重放；换电脑首次使用应再进行少量真实申请验证。
+Windows GitHub Actions 运行离线回归，不需要业务账号。真实快照与登录资料不进入仓库。换电脑或站点接口发生变化后，还需进行少量真实申请验收。
 
-Windows 下 Artifact Tool 图像渲染曾异常退出，当前输出通过数据和原生模板结构校验；这不等同于完成图像视觉检查或税局实际上传验证。
-
-## 分享与维护
-
-分享整个仓库即可，无需附带历史订单、发票、运行输出或认证资料。只在本地使用独立作业目录保存业务数据。
-
-本仓库维护 skill 源文件。规则或页面字段更新时，同步更新对应脚本、说明及测试；发布前检查内置模板仍为空白。没有自动安装全部依赖或无人值守登录机制。
+当前校验涵盖数据、金额和原模板结构，没有图像视觉检查或税局实际上传验证。多店可分别配置独立用户数据目录、固定非零调试端口、下载和输出目录；多店并行、隔夜会话及异常断网仍需专项验收，本项目不包含多店调度器。

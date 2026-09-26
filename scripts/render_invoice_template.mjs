@@ -7,7 +7,7 @@ const require=createRequire(path.resolve(process.env.INVOICE_NODE_MODULES,'../in
 const {FileBlob,SpreadsheetFile}=await import(pathToFileURL(require.resolve('@oai/artifact-tool')).href);
 
 const [inputPath,payloadPath,outputPath]=process.argv.slice(2);
-if (!outputPath) throw Error('Usage: render_invoice_template.mjs light.xlsx payload.json authored.xlsx [--render]');
+if (!outputPath || process.argv.length !== 5) throw Error('Usage: render_invoice_template.mjs light.xlsx payload.json authored.xlsx');
 const {schema,rows}=JSON.parse(await fs.readFile(payloadPath,'utf8'));
 const workbook=await SpreadsheetFile.importXlsx(await FileBlob.load(inputPath));
 for (const [name,meta] of Object.entries(schema)) {
@@ -24,9 +24,3 @@ workbook.recalculate();
 const output=await SpreadsheetFile.exportXlsx(workbook);
 await output.save(outputPath);
 console.log(JSON.stringify({authored:true,rows:Object.fromEntries(Object.entries(rows).map(([k,v])=>[k,v.length]))}));
-// Keep optional rendering after export: some Windows runtime versions exit in render().
-if(process.argv.includes('--render')){
-  const name=Object.keys(schema)[0];
-  const preview=await workbook.render({sheetName:name,range:'A3:G8',scale:1,format:'png'});
-  await fs.writeFile(outputPath+'.png',new Uint8Array(await preview.arrayBuffer()));
-}

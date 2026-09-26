@@ -33,7 +33,7 @@ ALIASES = {
     "match_amount": ("match_amount", "核对商品金额"),
     "match_amount_source": ("match_amount_source", "金额核对来源"),
     "invoice_total_amount": ("invoice_total_amount", "开票总金额"),
-    "application_status": ("application_status", "申请状态"),
+    "application_status": ("application_status", "开票状态", "申请状态"),
     "invoice_type": ("invoice_type", "发票类型"),
     "header_type": ("header_type", "抬头类型"),
     "invoice_title": ("invoice_title", "发票抬头"),
@@ -230,7 +230,9 @@ def make_order_items_index(rows: list[dict[str, Any]]) -> dict[str, list[dict[st
 def make_jst_index(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        goods_code = normalize_identifier(value(row, "goods_code"))
+        # Preserve source identity when live SKU spelling uses equivalent
+        # Unicode punctuation; raw sku_id remains provenance.
+        goods_code = normalize_identifier(row.get("_input_goods_code")) or normalize_identifier(value(row, "goods_code"))
         if goods_code:
             result[goods_code].append(row)
     return result
@@ -264,10 +266,10 @@ def base_fields(build: InvoiceBuild) -> dict[str, Any]:
     if any(marker in header for marker in ("企业", "公司", "个体工商户", "enterprise", "company")) and not fields["buyer_tax_id"]:
         build.error("企业抬头缺少购方税号")
     status = fields["application_status_snapshot"] or ""
-    if status and status not in {"待处理", "待开票", "1"}:
-        build.error(f"申请状态不在已验证的待处理值内: {status}")
+    if status and status != "待处理":
+        build.error(f"申请状态不在导出模板的待处理范围内: {status}")
     if status:
-        build.warnings.append("申请状态为导出快照；全流程入口另核对本次申请列表")
+        build.warnings.append("申请状态为导出模板快照；完整入口按同一规则筛选范围")
     return fields
 
 
@@ -316,10 +318,13 @@ def resolve_goods_code(
             item_quantity = value(item, "quantity")
             if source_quantity is not None and item_quantity is not None:
                 quantities = [parse_decimal(q, "匹配数量", []) for q in (source_quantity, item_quantity)]
-                if None in quantities or quantities[0] != quantities[1]:
+                if None in quantities:
+                    agrees = False
+                elif quantities[0] != quantities[1]:
                     agrees = False
             amount = verified_match_amount(item)
-            if amount is not None and not money_equal(amount, Decimal(str(value(raw_row, "goods_amount")).replace(",", ""))):
+            source_amount = Decimal(str(value(raw_row, "goods_amount")).replace(",", ""))
+            if amount is not None and not money_equal(amount, source_amount):
                 amount_conflict = True
                 agrees = False
             if agrees:
@@ -393,12 +398,25 @@ def details_for(
     order_items: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     details: list[dict[str, Any]] = []
+    extra_fees: list[tuple[int, dict[str, Any], Decimal]] = []
     previous_positive: dict[str, Any] | None = None
     previous_was_negative = False
 
     for source_row, row in build.rows:
-        amount = parse_decimal(value(row, "goods_amount"), f"源行 {source_row} 商品金额", build.errors)
+        is_extra_fee = clean_text(value(row, "source_goods_name")) == "价外费用"
+        amount_label = "价外费用金额" if is_extra_fee else "商品金额"
+        amount = parse_decimal(value(row, "goods_amount"), f"源行 {source_row} {amount_label}", build.errors)
         if amount is None:
+            previous_positive = None
+            previous_was_negative = False
+            continue
+        if is_extra_fee:
+            # A fee is source money, not another SKU or a discount. Resolve it only
+            # after counting every normal positive row of this invoice and order.
+            if amount <= ZERO:
+                build.error(f"源行 {source_row} 价外费用金额必须为正数，整票暂缓")
+            else:
+                extra_fees.append((source_row, row, amount))
             previous_positive = None
             previous_was_negative = False
             continue
@@ -435,8 +453,6 @@ def details_for(
             continue
 
         row_errors: list[str] = []
-        if clean_text(value(row, "source_goods_name")) == "价外费用":
-            row_errors.append(f"源行 {source_row} 为价外费用，当前未定义映射规则，整票暂缓")
         quantity = parse_decimal(value(row, "quantity"), f"源行 {source_row} 数量", row_errors)
         if quantity is not None and quantity <= ZERO:
             row_errors.append(f"源行 {source_row} 数量必须为正数")
@@ -464,10 +480,6 @@ def details_for(
             if zero_category and tax_rate_effective not in {None, "0"}:
                 row_errors.append(f"商品编码 {goods_code} 的零税率分类与显式税率冲突")
             tax_rate = tax_rate_effective
-            if tax_rate_effective == "0":
-                # User's tax-template rule: keep the output blank, retain zero for validation.
-                tax_rate = None
-                tax_rate_source = "jst_zero_rate_blank"
             template_rate_raw = value(row, "tax_rate")
             if clean_text(template_rate_raw) is not None and tax_rate_effective is not None:
                 template_rate = normalize_tax_text(template_rate_raw, row_errors, f"源行 {source_row} 千牛税率")
@@ -487,7 +499,10 @@ def details_for(
             "specification": clean_text(value(mapping, "specification")) if mapping else None,
             "unit": clean_text(value(mapping, "unit")) if mapping else None,
             "quantity": decimal_text(quantity) if quantity is not None else None,
-            "computed_unit_price": decimal_text(amount / quantity) if quantity and quantity > ZERO else None,
+            "computed_unit_price": decimal_text(amount / quantity) if quantity and amount * quantity > ZERO else None,
+            "original_amount": decimal_text(amount),
+            "extra_fee_amount": "0",
+            "extra_fee_source_rows": [],
             "amount": decimal_text(amount),
             "tax_rate": tax_rate,
             "tax_rate_effective": tax_rate_effective,
@@ -500,13 +515,47 @@ def details_for(
         previous_positive = detail
         previous_was_negative = False
 
+    for source_row, row, amount in extra_fees:
+        order_no = normalize_identifier(value(row, "order_no"))
+        if not order_no:
+            build.error(f"源行 {source_row} 价外费用缺少订单编号，无法确定归属，整票暂缓")
+            continue
+        recipients = [detail for detail in details if detail["order_no"] == order_no]
+        if len(recipients) != 1:
+            build.error(
+                f"源行 {source_row} 价外费用在同申请、同订单 {order_no} 中"
+                f"有 {len(recipients)} 个正商品源行，无法唯一确定归属，整票暂缓"
+            )
+            continue
+        recipient = recipients[0]
+        fee_errors: list[str] = []
+        for field_name, label in (("goods_code", "商品编码"), ("sub_order_no", "子订单号")):
+            explicit = normalize_identifier(value(row, field_name))
+            if explicit and explicit != recipient[field_name]:
+                fee_errors.append(f"源行 {source_row} 价外费用的{label}与归属商品不一致")
+        fee_rate = value(row, "tax_rate")
+        if clean_text(fee_rate) is not None:
+            normalized = normalize_tax_text(fee_rate, fee_errors, f"源行 {source_row} 价外费用税率")
+            if normalized is not None and normalized != recipient["tax_rate_effective"]:
+                fee_errors.append(f"源行 {source_row} 价外费用税率与归属商品税率不一致")
+        if fee_errors:
+            build.errors.extend(fee_errors)
+            continue
+        fee_total = Decimal(recipient["extra_fee_amount"]) + amount
+        recipient["extra_fee_amount"] = decimal_text(fee_total)
+        recipient["extra_fee_source_rows"].append(source_row)
+        recipient["amount"] = decimal_text(Decimal(recipient["original_amount"]) + fee_total)
+        if recipient["quantity"] is not None and Decimal(recipient["quantity"]) > ZERO:
+            recipient["computed_unit_price"] = decimal_text(Decimal(recipient["amount"]) / Decimal(recipient["quantity"]))
+
     if not details:
-        build.error("没有可开具的正商品金额明细")
+        build.error("没有可开具的商品金额明细")
     return details
 
 
 def expected_total(build: InvoiceBuild) -> Decimal | None:
     values = []
+    invalid = False
     for _, row in build.rows:
         raw = value(row, "invoice_total_amount")
         if clean_text(raw) is None:
@@ -514,6 +563,8 @@ def expected_total(build: InvoiceBuild) -> Decimal | None:
         parsed = parse_decimal(raw, "开票总金额", build.errors)
         if parsed is not None:
             values.append(parsed)
+        else:
+            invalid = True
     unique = []
     for item in values:
         if item not in unique:
@@ -523,7 +574,8 @@ def expected_total(build: InvoiceBuild) -> Decimal | None:
         return None
     if len(unique) > 1:
         build.error(f"同一申请流水号的开票总金额存在冲突: {[decimal_text(item) for item in unique]}")
-    return unique[0]
+        return None
+    return None if invalid else unique[0]
 
 
 def build_invoice(
@@ -533,20 +585,31 @@ def build_invoice(
     run: dict[str, Any],
     order_items: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    basic = base_fields(build)
-    details = details_for(build, order_goods, jst_index, order_items)
     expected = expected_total(build)
-    computed = sum((Decimal(line["amount"]) + Decimal(line["discount_amount"]) for line in details), ZERO)
-    if expected is not None and not money_equal(expected, computed):
-        build.error(
-            f"开票总金额不平: 模板 {decimal_text(expected)}，明细 {decimal_text(computed)}"
-        )
+    # Negative applications are deliberately excluded before any invoice fields
+    # or order/JST detail mapping are required. Ordinary discounts still apply
+    # to positive-total applications.
+    excluded_negative = expected is not None and expected < ZERO
+    if excluded_negative:
+        basic = {}
+        details = []
+        computed = None
+    else:
+        basic = base_fields(build)
+        details = details_for(build, order_goods, jst_index, order_items)
+        computed = sum((Decimal(line["amount"]) + Decimal(line["discount_amount"]) for line in details), ZERO)
+        if expected is not None and not money_equal(expected, computed):
+            build.error(
+                f"开票总金额不平: 模板 {decimal_text(expected)}，明细 {decimal_text(computed)}"
+            )
     normalized_invoice = {
         "invoice_serial_no": build.application_no,
+        "red_reversal": excluded_negative,
+        "exclusion_reason": "负数发票按规则不开具" if excluded_negative else None,
         "basic": basic,
         "detail_lines": details,
         "invoice_total_amount": decimal_text(expected) if expected is not None else None,
-        "computed_total_amount": decimal_text(computed),
+        "computed_total_amount": decimal_text(computed) if computed is not None else None,
         "issuer_taxpayer_id_fingerprint": clean_text(run.get("issuer_taxpayer_id_fingerprint")),
     }
     plan_hash = canonical_hash(normalized_invoice)
@@ -557,7 +620,7 @@ def build_invoice(
     idempotency_key = canonical_hash(
         {"issuer": issuer, "invoice": normalized_invoice}
     )
-    status = "blocked" if build.errors else "ready_for_export"
+    status = "blocked" if build.errors else "excluded_negative" if excluded_negative else "ready_for_export"
     return {
         **normalized_invoice,
         "plan_hash": plan_hash,
@@ -576,6 +639,15 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise ValueError("输入 JSON 顶层必须是对象")
     return loaded
+
+
+def invoice_total_for(invoices: list[dict[str, Any]], status: str | None = None) -> str | None:
+    """Sum authoritative application totals, including deliberately excluded ones."""
+    values = [invoice["invoice_total_amount"] for invoice in invoices
+              if status is None or invoice["status"] == status]
+    if any(amount is None for amount in values):
+        return None
+    return decimal_text(sum((Decimal(amount) for amount in values), ZERO))
 
 
 def main() -> int:
@@ -682,18 +754,14 @@ def main() -> int:
         "summary": {
             "selected_count": len(selected),
             "plan_count": len(invoices),
-            "ready_count": sum(not invoice["errors"] for invoice in invoices),
+            "ready_count": sum(invoice["status"] == "ready_for_export" for invoice in invoices),
             "blocked_count": sum(bool(invoice["errors"]) for invoice in invoices) + len(missing_selected),
+            "excluded_negative_count": sum(invoice["status"] == "excluded_negative" for invoice in invoices),
             "missing_application_ids": missing_selected,
-            "invoice_total_amount": decimal_text(
-                sum((Decimal(invoice["computed_total_amount"]) for invoice in invoices), ZERO)
-            ),
-            "ready_invoice_total_amount": decimal_text(
-                sum((Decimal(invoice["computed_total_amount"]) for invoice in invoices if not invoice["errors"]), ZERO)
-            ),
-            "blocked_invoice_total_amount": decimal_text(
-                sum((Decimal(invoice["computed_total_amount"]) for invoice in invoices if invoice["errors"]), ZERO)
-            ),
+            "invoice_total_amount": invoice_total_for(invoices),
+            "ready_invoice_total_amount": invoice_total_for(invoices, "ready_for_export"),
+            "blocked_invoice_total_amount": invoice_total_for(invoices, "blocked"),
+            "excluded_negative_invoice_total_amount": invoice_total_for(invoices, "excluded_negative"),
         },
     }
     rendered = json.dumps(output, ensure_ascii=False, indent=2) + "\n"

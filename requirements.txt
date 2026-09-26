@@ -1,1 +1,3 @@
+# Verified Python dependencies. Uses the installed Edge browser.
 lxml==6.1.1
+playwright==1.63.0

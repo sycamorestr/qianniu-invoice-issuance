@@ -1,5 +1,6 @@
 """Resolve template sheets/headers and preserve native XLSX parts during authoring."""
 from zipfile import ZipFile, ZIP_DEFLATED
+from decimal import Decimal
 import posixpath
 import re
 from lxml import etree as ET
@@ -134,16 +135,24 @@ def finalize(template,authored,output,schema):
                 raw=replace_data(raw,data)
             out.writestr(entry,raw)
 
+def is_ready_for_export(invoice):
+    """Explicit lifecycle status wins; status-less historical plans stay readable."""
+    return not invoice['errors'] and invoice.get('status','ready_for_export')=='ready_for_export'
+
 def make_output_rows(plan):
     require(not plan.get('fatal') and not plan.get('errors'), '全局数据错误，不能生成表格')
-    ready=[i for i in plan['invoices'] if not i['errors']]
+    ready=[i for i in plan['invoices'] if is_ready_for_export(i)]
     require(set(plan['selected_application_ids'])=={i['invoice_serial_no'] for i in plan['invoices']},'申请集合不完整')
     basic=[];details=[]
     for invoice in ready:
+        amount=Decimal(invoice['invoice_total_amount'])
+        require(amount.is_finite(),'申请总金额无效，不能生成表格')
+        if amount<0:
+            continue
         b={**invoice['basic'],'invoice_serial_no':invoice['invoice_serial_no'],'show_buyer_contact':None}
         basic.append({label:b.get(field) or '' for label,field in BASIC.items()})
         for line in invoice['detail_lines']:
-            row={label:line.get(field) or '' for label,field in DETAIL.items()}
+            row={label:'' if line.get(field) is None else line[field] for label,field in DETAIL.items()}
             row['单价']=''
             if row['折扣金额']=='0':row['折扣金额']=''
             details.append(row)

@@ -1,0 +1,36 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Business rules
+        run: python scripts/test_build_invoice_plan.py
+        env:
+          PYTHONUTF8: '1'
+      - name: Python regression
+        run: python -m unittest discover -s scripts -p "test_*.py"
+        env:
+          PYTHONUTF8: '1'
+      - name: Workbook pipeline
+        run: python scripts/test_pipeline.py
+        env:
+          PYTHONUTF8: '1'
+      - name: Page scripts with synthetic responses
+        run: node scripts/test_read_collectors.mjs

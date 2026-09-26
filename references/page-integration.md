@@ -1,55 +1,56 @@
-# 页面接入与接口证据
+# 页面接入与接口
 
-以下接口在原流程中已用登录页面验证。运行时仍须核对页面、主体、响应结构及查询条件，不能把历史版本号或租户值当默认值。此文档只描述采集和文件生成。
+本文用于接口或页面故障排查。接口基于已登录业务页面的实际调用，不是平台公开稳定 API；运行时仍须核对身份、查询范围及响应结构。租户值、用户标识和日期均取本次输入或当前页面，不能照抄历史快照。
 
-## 页面入口
+## 页面环境
 
-| 页面 | URL |
+| 角色 | 页面 URL |
 | --- | --- |
-| 千牛发票申请 | https://myseller.taobao.com/home.htm/merchant-invoice/ |
-| 千牛订单 | https://myseller.taobao.com/home.htm/trade-platform/tp/sold |
-| 票聚商品管理 | https://fp.erp321.com/setting/goodsManage |
-| 票聚商品 iframe | https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index |
+| `invoice` | `https://myseller.taobao.com/home.htm/merchant-invoice/` |
+| `orders` | `https://myseller.taobao.com/home.htm/trade-platform/tp/sold` |
+| `goods` | `https://fp.erp321.com/setting/goodsManage` |
+| 票聚商品 iframe | `https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index` |
 
-页面缺失时自行打开 URL 并复用登录态。核对页面标题、千牛店铺和票聚主体。票聚实际商品管理在跨域 iframe，不能把顶层空壳当成商品页。错误绑定解除后绑定正确页面。coid、uid、agentId 从当前已核对主体的真实请求/运行时取得。
+`playwright_adapter.py` 在一个后台事件循环中复用控制器。日常 `connect(open_missing=True)` 连接已经运行的专用 Edge，先复用页面，再按配置 URL 补齐缺页一次；不会启动浏览器进程。生命周期和故障边界见[浏览器控制](playwright-browser.md)。
 
-## 千牛申请与导出
+`playwright_context_qianniu.js` 通过 `/api/context`、`/api/shops` 核对当前千牛登录与店铺。票聚外层页面提供公司显示名称，`playwright_context_jst.js` 从当前商品 iframe 资源记录提取 `coid`、`uid`。公司名和带操作员的标签分别保存，`agentId` 取当前页面运行时或已核对的主体接口值。页面存在、URL 无 login 均不能代替身份核验。
 
-API 基址 https://einvoice.taobao.com，请求使用浏览器 credentials:include。
+控制器在对应 `Page` 或 `Frame` 执行本地 JS。请求使用 `credentials: "include"` 复用浏览器会话，不导出 Cookie、令牌、完整请求头或 HAR。浏览器页面不需要切到前台。
 
-申请列表：
+## 千牛申请诊断
+
+`read_qianniu.js` 的 `applications` 操作调用：
+
 ```text
-GET /api/qianniu/invoice/list/apply
+GET https://einvoice.taobao.com/api/qianniu/invoice/list/apply
 ?agentId=<本次值>&applyListType=0&pageSize=20
 &startTime=YYYY-MM-DD&endTime=YYYY-MM-DD&pageNo=0
 ```
 
-成功 code=200，数组 data，总数 total，另有 hasMoreCount。字段 serialNo、tid、amount、applyStatus、applyTime、tradeLink。待处理状态实测 applyStatus=1。pageNo 从 0 起；完整分页数和唯一流水号数必须等于 total。
+响应要求 `code=200`，数据在 `data`，页码从 0 开始。读取完整分页，流水号唯一，分页中服务端 total 必须稳定。字段包括 `serialNo`、`tid`、`amount`、`applyStatus`、`applyTime`。服务端 total 与实际观察行数可能不同，因此分别记录 `api_total` 和 `observed_total`。
 
-页面 searchContent 还可能包含 status、rightsRemainTime、rightsFlag、payerName、tid。按日期生成全日文件时确认没有残留买家、订单等额外筛选；若用户指定额外范围，应将该范围作为明确输入，不能默默继承。日期跨度不得超过页面允许的两个月，标准脚本逐日运行。
+申请列表只用于诊断和订单关联。`applyStatus`、页面“已准”等状态不能改变导出原件定义的选择范围。标准任务按单日运行，不继承页面上残留的买家、订单等筛选。
 
-通用模板：
+## 通用模板导出
+
+`read_qianniu.js` 的 `export` 操作调用：
+
 ```text
-GET /api/invoice/batch4visitor/apply
+GET https://einvoice.taobao.com/api/invoice/batch4visitor/apply
 ?startTime=YYYY-MM-DD&endTime=YYYY-MM-DD&pageNo=0&pageSize=20&agentId=<本次值>
 ```
 
-它是必要源文件，包含申请流水号、订单编号、总金额、状态、货物名称、数量、正负商品金额、税率、编码、抬头/税号、地址/电话/银行/账号及备注。一个申请可能多行，必须保留源序。
+该接口具有页面“全选后导出通用模板”的全量语义，无需操作搜索、全选或下载按钮。页面脚本直接读取响应二进制，经 Base64 传给本地编排器，解码保存为 `qianniu_common.xlsx`。没有额外的下载 URL 捕获或浏览器外会话重放步骤。
 
-税局模板基底默认使用 skill 内置 assets/tax-bureau-template-V260401.xlsx，无需每次下载或让用户提供。用户明确提供其他版本时通过 --template 指定并验证结构。需要更新版本时也可从页面取得：
-```text
-GET /api/invoice/tax-bureau-export/exportTaxBureauInvoiceInfo
-?<当前筛选>&agentId=<本次值>&tabCode=APPLY
-POST /api/invoice/tax-bureau-export/downloadTemplate
-```
+响应须通过 HTTP、登录跳转、ZIP 文件头、工作表和必要字段检查。数据以事务检查点发布，规则见[原子发布和恢复](input-output-contract.md#原子发布和恢复)。原始 XLSX 必须保留全部源行及顺序。
 
-第二个是下载模板及规则的空参数 POST。导出接口不改变申请状态。通用模板不能被税局模板替代，因为它保留了源商品、折扣和订单关联。
+只有通用模板决定范围：优先“开票状态”，为空才回退“申请状态”，精确为“待处理”的源行进入生成。其他状态保留在原件中，不查询其订单或写入税局模板。
 
-导出返回带会话的 Blob/XLSX；实测无会话 PowerShell 直接请求返回 302。稳定方式是在登录页 fetch，再将文件字节经 Base64 交本地保存。检查 HTTP 成功、没有跳到登录页、ZIP 文件头、工作簿必需表头及申请覆盖，记录 SHA-256。不要提取 Cookie 以拼接下载命令。
+税局空白模板来自 `assets/tax-bureau-template-V260401.xlsx`，日常无需重新下载。模板版本更换需单独核验字段、隐藏字典及数据区，不能把通用模板当税局模板。
 
-可用的只读主体接口：GET /api/context、GET /api/shops。保留业务主体摘要，不记录认证信息。
+## 千牛订单批量查询
 
-## 千牛批量订单
+`read_qianniu.js` 的 `orders` 操作调用：
 
 ```text
 POST https://trade.taobao.com/trade/itemlist/asyncSold.htm
@@ -57,55 +58,59 @@ POST https://trade.taobao.com/trade/itemlist/asyncSold.htm
 Content-Type: application/x-www-form-urlencoded; charset=UTF-8
 
 bizOrderId=<最多50个逗号分隔订单号>
-auctionId=
-buyerNick=
 batchType=bizOrderId
 isBatchSearch=true
 pageNum=1
 ```
 
-合并当前页面的必要查询默认值；近三个月页 tabCode=latest3Months 是已验证样例，历史订单不能假定仍在此页。响应 query 是规范化回显，不能当作免登录 API。
+脚本补齐已验证的页面查询默认值，并记录响应 `query` 和查询指纹。当前默认范围为 `latest3Months`，不能把未返回项直接称为历史订单。若需历史批查，必须先验证相应参数；没有已验证参数时仅对缺失项补详情。
 
-响应 mainOrders 和 page.totalNumber/totalPage：
-- mainOrders[].id → 主订单号。
-- subOrders[].idStr → 子订单号。
-- subOrders[].quantity → 数量。
-- subOrders[].priceInfo.realTotal → 接口金额，未核对口径不能用于匹配。
-- subOrders[].itemInfo.title / skuText[] → 标题 / 规格。
-- subOrders[].itemInfo.extra 中 name="商家编码" 的 value → 完整编码。
+| 响应字段 | 用途 |
+| --- | --- |
+| `mainOrders[].id` | 主订单号 |
+| `subOrders[].idStr` | 字符串子订单号 |
+| `subOrders[].quantity` | 匹配数量 |
+| `itemInfo.title` / `skuText[]` | 标题与规格 |
+| `itemInfo.extra` 中“商家编码”的 `value` | 完整商品编码 |
+| `priceInfo.realTotal` | 辅助信息，未经金额口径核验不能匹配源金额 |
 
-接口已观察到 GBK 内容。按响应字符集解码，缺失时使用已验证 GBK，不能 response.json() 后把乱码当缺字段。每批读完分页，校验返回订单属于输入、没有重复、总数完整；未命中的编号另查历史详情。
+按响应字符集解码，缺失时使用已验证的 GBK 默认值。读取 `page.totalNumber/totalPage` 指定的完整分页，检查订单属于本次输入、没有重复、返回与缺失集合覆盖请求。不能只取当前可见 DOM 列表。
 
-历史详情实测入口 https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId=<订单号>。read_order_detail.js 只读 DOM，先核对 URL 参数及页面订单号，再提取同一商品行的编码、标题、数量、规格、单价×数量文本。DOM 结构变化或无法提取时停止该项，不推测字段位置。
+## 必要订单详情补证
 
-多商品金额样例曾出现列表接口值与详情值不同；因此只用已解释的详情/优惠口径建立 match_evidence，不按金额排序配对。
+批量缺失或本地计划仍有歧义时，复用同一个 `orders` 页导航到：
 
-## 票聚商品
+```text
+https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId=<订单号>
+```
+
+等待 URL 和页面订单号一致、商品行及商家编码就绪，再执行 `read_order_detail.js`。该脚本读取 DOM 商品行，并核验 React 运行时中的字符串子订单号，避免 19 位数字精度损失。读取结束后恢复同一页面的订单列表 URL。
+
+`old_details.json`、`supplemental_details.json` 必须合并消费，字段冲突不能静默覆盖。`order_evidence.py` 检查同一商品行原始价格、数量、来源 URL/时间及与源商品金额的唯一对应，推导证据写入 `derived_match_evidence.json`。列表金额、行顺序、金额大小均不能替代可靠关联；页面结构变化或证据不足则暂缓相关整票。
+
+## 票聚商品查询
+
+`query_jst_invoice_goods.js` 在商品 iframe 中执行，接收对象 `{codes, context: {coid, uid}}`，直接返回对象。请求为：
 
 ```text
 POST https://apiweb.erp321.com/webapi/ItemApi/ItemSku/GetPageListV2
 Content-Type: application/json
 ```
 
-直接 fetch HTTP body：
 ```json
 {
-  "page":{"currentPage":1,"pageSize":50,"hasPageInfo":false,"pageAction":1},
-  "data":{"sku_id":"@@完整编码","queryFlds":["sku_id","properties_value","invoice_name","invoice_spec","issuing_office","tax_code","tax_rate","tax_rate_zero","invoice_enabled","vc_name","enabled"]},
-  "ip":"",
-  "coid":"当前主体",
-  "uid":"当前用户"
+  "page": {"currentPage": 1, "pageSize": 50, "hasPageInfo": false, "pageAction": 1},
+  "data": {"sku_id": "@@完整编码", "queryFlds": ["sku_id", "properties_value", "invoice_name", "issuing_office", "tax_code", "tax_rate", "tax_rate_zero", "invoice_enabled"]},
+  "ip": "",
+  "coid": "当前主体标识",
+  "uid": "当前用户标识"
 }
 ```
 
-不传 sku_type、enabled。页面运行时还存在 data/query/isMainDB 包装层，不要把包装层直接当作 HTTP body。默认普通商品过滤会漏组合装；默认启用过滤会漏停用但 invoice_enabled=true 的商品。两项不限后再判断不存在。
+上例列出主要返回字段，完整 `queryFlds` 以脚本为准。`sku_type`、`enabled` 可以请求返回，但不作为筛选条件。商品类型和商品状态均不限，最后仍要求 `invoice_enabled=true`；否则会漏掉组合装或停用但允许开票的商品。
 
-成功 body.code=0 且 body.act=0，数组 body.data。body.page.count 实测可能 -1，不能据此判断不存在。逐条比较完整 sku_id，要求唯一；若响应显示仍有后续页，不得仅凭第一页唯一结果宣称唯一。
+成功要求 `code=0` 且 `act=0`，数组在 `data`。完整 `sku_id` 必须唯一；仅全角/半角括号可归一后唯一匹配，保留原始编码、输入编码及 `match_basis`。多候选仍暂缓。若返回后续页或达到当前页上限，不得凭第一页宣称唯一。
 
-字段映射见 flow-and-field-mapping.md。invoice_qty、商品单价和 invoice_spec 只作来源信息，不覆盖源数量、单价或规格。商品编辑、导入、修改等写接口不在本技能范围。
+编排器每批最多 40 编码；脚本逐编码查询，8 路并发，结果保持输入顺序。每请求 8 秒超时覆盖响应体读取，网络超时/Abort 和 429/502/503/504 最多重试 2 次。认证失效响应立即取消其余请求并终止阶段；其他异常记录为逐编码 `request_failed`。普通未命中和多匹配不反复查询。成功项与失败项一起保存，便于只补失败编码。
 
-## 故障处理
-
-登录失效、验证码、权限不足或主体变更时停止对应采集并报告具体问题。网络超时或 429/502/503/504 可有限重试只读请求；不无限重试。保存已成功检查点，失败编号单独补查，新的采集结果不得覆盖同名文件。
-
-查询脚本需先经当前工具允许的页面上下文执行。登录仍在但页面未打开不构成阻断。记录实际运行的日期、URL、核对时间、查询条件和原始业务响应，不保存完整 HAR 或认证信息。
+商品名称、规格、单位、税码、税率的业务解释见[字段映射](flow-and-field-mapping.md)。本技能不调用商品编辑、导入或开票提交接口。

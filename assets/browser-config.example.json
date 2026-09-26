@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "browser": "Edge",
+  "user_data_dir": "data/edge/shop-example",
+  "profile_directory": "Default",
+  "remote_debugging_port": 9222,
+  "download_dir": "data/downloads/shop-example",
+  "browser_sessions": {
+    "invoice": {"url": "https://myseller.taobao.com/home.htm/merchant-invoice/"},
+    "orders": {"url": "https://myseller.taobao.com/home.htm/trade-platform/tp/sold"},
+    "goods": {"url": "https://fp.erp321.com/setting/goodsManage"}
+  }
+}

@@ -164,9 +164,111 @@ def test_direct_goods_code_must_belong_to_order_result() -> None:
 def test_negative_without_predecessor_is_blocked() -> None:
     source = valid_source()
     source["template_rows"] = source["template_rows"][1:]
-    source["template_rows"][0]["开票总金额"] = "-4.00"
+    source["template_rows"][0]["开票总金额"] = "4.00"
     invoice = build(source)
     assert any("负商品金额前没有正商品金额" in error for error in invoice["errors"])
+
+
+def red_source() -> dict:
+    source = valid_source()
+    row = source["template_rows"][0]
+    row.update({"订单编号": "9000000000000000001", "开票总金额": "-18.90",
+                "货物名称": "测试商品", "数量": "-1", "商品金额": "-18.90"})
+    source["template_rows"] = [row]
+    source["order_goods"] = [{"订单编号": row["订单编号"], "商品编码": "TEST-SKU-2"}]
+    source["order_items"] = [{"订单编号": row["订单编号"], "子订单号": "original-suborder-1",
+                               "商品编码": "TEST-SKU-2", "商品标题": row["货物名称"], "数量": "1"}]
+    source["jst_invoice_goods"][0]["商品编码"] = "TEST-SKU-2"
+    return source
+
+
+def test_negative_invoice_is_excluded_before_detail_generation() -> None:
+    source = red_source()
+    invoice = build(source)
+    assert invoice["errors"] == [], invoice["errors"]
+    assert invoice["red_reversal"] is True
+    assert invoice["status"] == "excluded_negative"
+    assert invoice["exclusion_reason"] == "负数发票按规则不开具"
+    assert invoice["invoice_total_amount"] == "-18.9"
+    assert invoice["computed_total_amount"] is None
+    assert invoice["detail_lines"] == []
+    ordinary = build(valid_source())
+    assert ordinary["red_reversal"] is False
+    assert ordinary["detail_lines"][0]["discount_amount"] == "-4"
+
+
+def test_negative_invoice_with_multiple_rows_is_excluded_as_a_whole() -> None:
+    source = red_source()
+    source["template_rows"][0]["开票总金额"] = "-26.90"
+    other = {"申请流水号": "A-1", "订单编号": "O-2", "货物名称": "商品乙",
+             "数量": "-2", "商品金额": "-8.00"}
+    source["template_rows"].append(other)
+    invoice = build(source)
+    assert invoice["errors"] == [], invoice["errors"]
+    assert invoice["status"] == "excluded_negative"
+    assert invoice["detail_lines"] == []
+    assert invoice["invoice_total_amount"] == "-26.9"
+
+
+def test_negative_exclusion_does_not_require_invoice_fields_or_order_mapping() -> None:
+    for quantity in [None, "", "0", "1", "NaN", "Infinity", "-Infinity"]:
+        source = red_source()
+        source["template_rows"][0]["数量"] = quantity
+        for field in ("发票类型", "抬头类型", "发票抬头", "购方税号"):
+            del source["template_rows"][0][field]
+        source["order_goods"] = []
+        source["order_items"] = []
+        source["jst_invoice_goods"] = []
+        invoice = build(source)
+        assert invoice["status"] == "excluded_negative", quantity
+        assert invoice["errors"] == [], invoice["errors"]
+        assert invoice["detail_lines"] == []
+
+
+def test_negative_exclusion_requires_consistent_finite_application_total() -> None:
+    for total in ["18.90", "-19.90", "NaN", "Infinity", "-Infinity"]:
+        source = red_source()
+        other = deepcopy(source["template_rows"][0])
+        other["开票总金额"] = total
+        source["template_rows"].append(other)
+        invoice = build(source)
+        assert invoice["status"] == "blocked"
+        assert invoice["red_reversal"] is False
+        assert any("开票总金额" in error for error in invoice["errors"])
+
+
+def test_negative_total_excludes_mixed_rows_without_partial_output() -> None:
+    source = red_source()
+    source["template_rows"].append({"申请流水号": "A-1", "订单编号": "O-2",
+                                    "商品金额": "5.00", "数量": "1"})
+    source["template_rows"][0]["开票总金额"] = "-13.90"
+    invoice = build(source)
+    assert invoice["status"] == "excluded_negative"
+    assert invoice["detail_lines"] == [] and invoice["errors"] == []
+    for amount in ["5.00", "-5.00"]:
+        source = red_source()
+        source["template_rows"].append({"申请流水号": "A-1", "订单编号": "9000000000000000001",
+                                        "货物名称": "价外费用", "商品金额": amount, "数量": "-1"})
+        invoice = build(source)
+        assert invoice["status"] == "excluded_negative"
+        assert invoice["detail_lines"] == [] and invoice["errors"] == []
+
+
+def test_negative_exclusion_is_separate_from_ready_and_blocked_totals() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        input_path = Path(directory) / "input.json"
+        output_path = Path(directory) / "plan.json"
+        input_path.write_text(json.dumps(red_source(), ensure_ascii=False), encoding="utf-8")
+        result = subprocess.run([sys.executable, str(SCRIPT), str(input_path), "--output", str(output_path)],
+                                check=False, capture_output=True, text=True, encoding="utf-8")
+        assert result.returncode == 0, result.stderr
+        plan = json.loads(output_path.read_text(encoding="utf-8"))
+        assert plan["blocked"] is False
+        assert plan["summary"]["ready_count"] == plan["summary"]["blocked_count"] == 0
+        assert plan["summary"]["excluded_negative_count"] == 1
+        assert plan["summary"]["ready_invoice_total_amount"] == "0"
+        assert plan["summary"]["blocked_invoice_total_amount"] == "0"
+        assert plan["summary"]["excluded_negative_invoice_total_amount"] == "-18.9"
 
 
 def test_multiple_order_goods_is_blocked() -> None:
@@ -272,7 +374,7 @@ def test_cli_writes_a_plan() -> None:
         assert plan["invoices"][0]["status"] == "ready_for_export"
 
 
-def test_zero_rate_is_blank_but_conflicts_are_checked() -> None:
+def test_zero_rate_is_written_explicitly_and_conflicts_are_checked() -> None:
     for rate,category in [(None,'零税率'),('0','零税率'),(0,'默认'),(None,'0%税率')]:
         source=valid_source();mapping=source['jst_invoice_goods'][0]
         mapping['虚拟分类']=category;mapping['tax_rate']=rate
@@ -281,8 +383,8 @@ def test_zero_rate_is_blank_but_conflicts_are_checked() -> None:
         result=build(source)
         assert result['errors']==[],result['errors']
         line=result['detail_lines'][0]
-        assert line['tax_rate'] is None and line['tax_rate_effective']=='0'
-        assert line['tax_rate_source']=='jst_zero_rate_blank'
+        assert line['tax_rate']=='0' and line['tax_rate_effective']=='0'
+        assert line['tax_rate_source']==('jst_tax_rate' if rate is not None else 'jst_virtual_category')
         assert line['discount_amount']=='-4'
         source['template_rows'][1]['税率']='13%'
         assert any('折扣税率' in e for e in build(source)['errors'])
@@ -318,9 +420,101 @@ def test_verified_amount_disambiguates_without_changing_discount() -> None:
     assert any('多个商品编码' in e for e in build(source)['errors'])
 
 
-def test_additional_fee_blocks_whole_invoice() -> None:
+def test_additional_fee_without_merchandise_blocks_whole_invoice() -> None:
     source=valid_source();source['template_rows'][0]['货物名称']='价外费用'
     assert any('价外费用' in e for e in build(source)['errors'])
+
+
+def fee_row(amount: str = '5.00', **fields: str) -> dict:
+    return {'申请流水号':'A-1','订单编号':'O-1','货物名称':'价外费用',
+            '数量':'1','商品金额':amount, **fields}
+
+
+def test_additional_fees_accumulate_without_changing_quantity_or_discount() -> None:
+    source=valid_source()
+    source['template_rows'][0]['开票总金额']='71.30'
+    source['template_rows'] += [fee_row(), fee_row('1.00', 税率='13%')]
+    invoice=build(source)
+    assert invoice['errors']==[], invoice['errors']
+    assert invoice['computed_total_amount']=='71.3'
+    assert len(invoice['detail_lines'])==1
+    line=invoice['detail_lines'][0]
+    assert line['original_amount']=='69.3'
+    assert line['extra_fee_amount']=='6'
+    assert line['extra_fee_source_rows']==[3,4]
+    assert line['amount']=='75.3'
+    assert line['quantity']=='7'
+    assert line['discount_amount']=='-4' and line['discount_source_row']==2
+    assert line['goods_code']=='SKU-1'
+
+
+def test_additional_fee_can_precede_its_unique_product() -> None:
+    source=valid_source()
+    source['template_rows'][0]['开票总金额']='70.30'
+    source['template_rows'].insert(0,fee_row())
+    invoice=build(source)
+    assert invoice['errors']==[], invoice['errors']
+    line=invoice['detail_lines'][0]
+    assert line['source_row']==2 and line['extra_fee_source_rows']==[1]
+    assert line['discount_source_row']==3 and line['amount']=='74.3'
+
+
+def test_additional_fee_matching_uses_original_product_amount() -> None:
+    source=valid_source()
+    source['template_rows'][0]['开票总金额']='70.30'
+    source['template_rows'].append(fee_row())
+    source['order_items']=[{'订单编号':'O-1','子订单号':'S1','商品编码':'SKU-1','数量':'7',
+                            'match_amount':'69.30','match_amount_source':'order_detail_gross'}]
+    invoice=build(source)
+    assert invoice['errors']==[], invoice['errors']
+    assert invoice['detail_lines'][0]['amount']=='74.3'
+    assert invoice['detail_lines'][0]['order_item_evidence']['match_amount']=='69.30'
+
+
+def test_additional_fee_does_not_guess_among_multiple_product_rows() -> None:
+    source=valid_source()
+    source['template_rows'][0]['开票总金额']='80.30'
+    source['template_rows'] += [{'申请流水号':'A-1','订单编号':'O-1','数量':'1','商品金额':'10.00'}, fee_row()]
+    invoice=build(source)
+    assert invoice['status']=='blocked'
+    assert any('价外费用' in error and '2 个正商品源行' in error for error in invoice['errors'])
+    assert all(line['extra_fee_amount']=='0' and line['extra_fee_source_rows']==[] for line in invoice['detail_lines'])
+
+
+def test_additional_fee_requires_same_order_and_no_explicit_field_conflicts() -> None:
+    for fields, expected in [({'订单编号':'O-OTHER'}, '0 个正商品源行'),
+                             ({'订单编号':''}, '缺少订单编号'),
+                             ({'税率':'9%'}, '价外费用税率与归属商品税率不一致'),
+                             ({'税率':'未知'}, '不是有效百分比'),
+                             ({'商品编码':'OTHER'}, '商品编码与归属商品不一致'),
+                             ({'子订单号':'OTHER'}, '子订单号与归属商品不一致')]:
+        source=valid_source()
+        source['template_rows'][0]['开票总金额']='70.30'
+        source['template_rows'].append(fee_row(**fields))
+        invoice=build(source)
+        assert invoice['status']=='blocked'
+        assert any(expected in error for error in invoice['errors']), invoice['errors']
+
+
+def test_nonpositive_or_nonfinite_additional_fee_is_not_a_discount() -> None:
+    for amount in ['-5.00','0','NaN','Infinity']:
+        source=valid_source()
+        source['template_rows']=source['template_rows'][:1]+[fee_row(amount)]
+        invoice=build(source)
+        assert invoice['status']=='blocked'
+        assert any('价外费用金额' in error for error in invoice['errors'])
+        assert invoice['detail_lines'][0]['discount_amount']=='0'
+        assert invoice['detail_lines'][0]['extra_fee_source_rows']==[]
+
+
+def test_additional_fee_does_not_bridge_discount_adjacency() -> None:
+    source=valid_source()
+    source['template_rows'][0]['开票总金额']='70.30'
+    source['template_rows'].insert(1,fee_row())
+    invoice=build(source)
+    assert invoice['status']=='blocked'
+    assert any('负商品金额前没有正商品金额' in error for error in invoice['errors'])
+    assert invoice['detail_lines'][0]['discount_amount']=='0'
 
 
 def test_unknown_status_and_invoice_enabled_are_blocked() -> None:
