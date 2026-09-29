@@ -19,13 +19,15 @@ shop_registry.py：读取原清单及工作台新增登记，校验隔离与环�
 
 ## 参数和运行环境
 
-新任务必须提供日期、店铺、票聚主体和浏览器配置。配置也可通过 `QIANNIU_BROWSER_CONFIG` 指定。`--run-dir` 可指定尚不存在的新作业目录，默认目录由店铺标识、日期和微秒时间组成。
+新任务必须提供查询范围、店铺、票聚主体和浏览器配置。范围显式二选一：`--date YYYY-MM-DD` 或 `--all-pending`，不能同时提供，也不能都省略后默认为全量。配置也可通过 `QIANNIU_BROWSER_CONFIG` 指定。`--run-dir` 可指定尚不存在的新作业目录，默认目录由店铺标识、范围标签和微秒时间组成。
+
+`--all-pending` 按约定查询最近两个日历月：以创建时的北京时间今日为结束日期，向前两个日历月为开始日期，包含首尾两天。例如 2026-09-28 创建的任务固定为 2026-07-28 至 2026-09-28。新任务默认只处理开票倒计时已开始的申请，保存 `date=null` 及 `query_scope={"mode":"all_pending","start_date":"2026-07-28","end_date":"2026-09-28","countdown":"started"}`；文件及目录范围标签使用 `all-pending`。新单日任务保存 `date` 及 `query_scope={"mode":"date","date":"YYYY-MM-DD","countdown":"started"}`。倒计时筛选在创建时冻结，旧任务缺字段则恢复原无筛选范围，不静默改变旧检查点或输出。
 
 单店可传 `--expected-account <已确认的完整千牛子账号>`；多店自动使用该店记录的 `login_username` 作为同一约束。提供时须与页面 `context.realNick` 精确匹配，允许 `store` 为显示别名；未提供时仍用 `store` 做原来的精确核验。账号是核验依据，不是密码或自动登录输入，也不能从显示名、普通备注猜出账号。
 
 `--jst-browser-config <配置>` 可指定独立共享票聚浏览器，此时千牛配置可为工作台 `home` 或原 `invoice/orders` 配置，运行器在内存中补齐业务角色而不改写原配置；票聚配置只含 `goods`。省略时保持原有单浏览器三角色模式。
 
-多店入口 `run_batch.py --registry <shops.json> --date YYYY-MM-DD` 合并原清单和旁侧 `.browser-workbench-shops.json`，在同一 issuer 下串行调用单店入口。新批次默认选择合并清单中的所有当前店铺；`--shops` 限定店铺 id，`--resume` 恢复原批次冻结的店铺范围。完整契约见[多店配置与运行](multi-shop.md)。
+多店入口 `run_batch.py --registry <shops.json> --date YYYY-MM-DD` 或 `run_batch.py --registry <shops.json> --all-pending` 合并原清单和旁侧 `.browser-workbench-shops.json`，在同一 issuer 下串行调用单店入口。新批次默认选择合并清单中的所有当前店铺；`--shops` 限定店铺 id，`--resume` 恢复原批次冻结的店铺与日期范围。最近两个月的开始、结束日期在批次创建时只计算一次，所有店铺沿用，不逐店移动窗口。完整契约见[多店配置与运行](multi-shop.md)。
 
 两个在线入口默认按需启动：已有环境复用，确认未运行时按现有固定数据目录、Profile 和端口启动正常 Edge 一次，读取浏览器保存的会话。`--connect-only` 禁止启动进程，但仍执行采集和一次性缺页恢复。该选项不是诊断模式；`status` 等诊断命令保持只读。配置冲突、进程归属不符或采集中途断连不触发换端口或循环重启。
 
@@ -36,7 +38,7 @@ shop_registry.py：读取原清单及工作台新增登记，校验隔离与环�
   --node $node --node-modules $nodeModules
 ```
 
-`--resume <作业目录>` 恢复原任务；日期、店铺、账号约束、主体、浏览器数据目录及 Profile 不可改变。双浏览器任务还绑定共享票聚配置路径和环境身份；不能在恢复中改为另一浏览器或临时增加共享配置。`--replay-input <输入目录>` 不连接浏览器，结果标为离线。`--plan-only` 输出计划、异常和原件副本，不写税局 XLSX。
+`--resume <作业目录>` 恢复原任务，可从快照读取范围；日期模式、开始/结束日期、店铺、账号约束、主体、浏览器数据目录及 Profile 不可改变。最近两个月模式跨日恢复仍沿用原 `query_scope`，不按恢复当天重算。双浏览器任务还绑定共享票聚配置路径和环境身份；不能在恢复中改为另一浏览器或临时增加共享配置。`--replay-input <输入目录>` 不连接浏览器，结果标为离线。`--plan-only` 输出计划、异常和原件副本，不写税局 XLSX。
 
 兼容旧失败作业时，仅在原账号约束为空、千牛 context 尚未保存且不存在其检查点、回执或发布事务证据时，代码允许首次绑定明确账号；已有身份证据后禁止增加或更改账号约束。不得手改检查点触发这一兼容分支。
 
@@ -54,23 +56,27 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 | 操作 | 输入要点 | 输出 |
 | --- | --- | --- |
-| 千牛申请 | `operation: applications`、日期、当前 `agentId` | 全分页申请诊断快照 |
-| 千牛导出 | `operation: export`、日期、当前 `agentId` | 原始响应字节；非空须为 XLSX，零字节须与明确空列表联合核验 |
+| 千牛申请 | `operation: applications`、单日或冻结的 `query_scope`、当前 `agentId` | 本次日期范围的全分页申请诊断快照 |
+| 千牛导出 | `operation: export`、同一日期范围、当前 `agentId` | 原始响应字节；非空须为 XLSX，零字节须与明确空列表联合核验 |
 | 千牛订单 | `operation: orders`、1–50 个字符串订单号、可选查询条件 | 完整分页、明细、明确缺失集合 |
 | 订单详情 | 当前字符串订单号 | 已核对订单号的 DOM/运行时明细 |
 | 票聚商品 | 1–40 个编码、当前 `coid` / `uid` | 保持输入顺序的逐编码查询结果 |
 
 订单号和子订单号必须是字符串，不能先转数值再转回。返回订单须属于本批输入，不能重复；返回集合与缺失集合共同覆盖请求范围。票聚结果必须覆盖请求编码集合；未命中/多匹配属于业务结果，`request_failed` 才进入失败补查。
 
+申请与导出接口都显式传入 `startTime/endTime`：单日为同一天，`all_pending` 为冻结的 `start_date/end_date`。不能省略日期、传空值或扩大超过已确认的两个月范围。导出保留该范围完整原件，再按原件状态选择，不把申请列表状态替代业务范围。
+
+`countdown="started"` 时两接口还传 `rightsRemainTime=100`。导出端实际不执行此倒计时筛选，选择阶段必须以完整筛后列表的流水号集合与通用模板“待处理”集合取交集。列表状态不作筛选依据，也不能凭缺失/不完整列表认定无申请。原件含未入选记录仍原样交付，筛选证据与原件一并绑定选择哈希。
+
 ## 原始检查点
 
 | 文件 | 契约 |
 | --- | --- |
-| `capture_context.json` | 日期、店铺显示名、原始 `observed_store/account_nick`、账号约束、公司、主体核验时间、业务 URL、当前 agentId/coid/uid、Profile、`context_sha256` |
+| `capture_context.json` | 日期或冻结的 `query_scope`、店铺显示名、原始 `observed_store/account_nick`、账号约束、公司、主体核验时间、业务 URL、当前 agentId/coid/uid、Profile、`context_sha256` |
 | `common-export.bin` | 新导出的不可变原始下载检查点，保留响应原字节；可以是已核验的零字节响应 |
-| `qianniu_common.xlsx` | 非空下载通过 ZIP 校验后的字节一致原件；工作表“开票申请列表”；唯一范围及金额来源；旧作业可直接以此为下载检查点 |
-| `applications.json` | 全部观察行、`api_total`、`observed_total` 及非待处理诊断子集；`applyStatus` 不参与选择 |
-| `selection.json` | 原件哈希、状态分布、源行和原序去重的待处理流水号；源范围不可变 |
+| `qianniu_common.xlsx` | 非空下载通过 ZIP 校验后的字节一致原件；工作表“开票申请列表”；状态、数量及金额来源，倒计时资格另据筛后申请列表；旧作业可直接以此为下载检查点 |
+| `applications.json` | 本次筛选下全部观察行、`api_total`、`observed_total` 及非待处理诊断子集；`applyStatus` 不参与选择，started模式流水号作为倒计时资格证据 |
+| `selection.json` | 原件哈希、状态分布、源行及入选流水号；started模式额外绑定范围、筛后列表哈希及倒计时未入选记录；源范围不可变 |
 | `order_ids.json` | 选择哈希、活跃申请、负数排除申请、需要查询的订单号 |
 | `order_batches.json` | 合并后的批次、订单明细、缺失订单，绑定原件及选择哈希 |
 | `old_details.json` / `supplemental_details.json` | 已核对订单号的详情；两者合并消费，可靠子订单键发生字段冲突则停止 |
@@ -78,9 +84,9 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 | `jst_query.json` | 原始编码、查询编码、匹配依据、候选及失败结果，覆盖全部请求编码 |
 | `parts_manifest.json` | 业务批次路径、SHA-256、阶段和登记时间 |
 
-通用模板状态优先“开票状态”，为空才回退“申请状态”，仅精确为“待处理”的源行进入选择。缺两列时停止。负总额发票仍留在 `selected`，但不进入订单/票聚查询，因此 `selected = ready + blocked + excluded`。
+通用模板状态优先“开票状态”，为空才回退“申请状态”，仅精确为“待处理”的源行可进入选择；started模式还须出现在完整筛后申请清单中。缺状态列或筛选证据不完整时停止。选中的负总额发票仍留在 `selected`，但不进入订单/票聚查询，因此 `selected = ready + blocked + excluded`。未开始倒计时的申请属于未入选范围，不混入业务异常或负票排除计数。
 
-申请列表为零也必须尝试一次通用模板导出。只有本次日期的 `applications.json` 已验证 `rows=[]`，`total/api_total/observed_total` 均明确为数值零，且导出 HTTP 成功、无登录跳转、响应确为零字节，才允许没有 XLSX 的 `no_applications` 终态。保留空 `common-export.bin`、列表快照、导出请求及哈希回执；不把缺失计数、错误页或非空非 ZIP 响应当作无申请。列表为零但导出非空时仍以实际通用模板定义范围。
+申请列表为零也必须尝试一次通用模板导出。只有同一本次日期范围的 `applications.json` 已验证 `rows=[]`，`total/api_total/observed_total` 均明确为数值零，且导出 HTTP 成功、无登录跳转、响应确为零字节，才允许没有 XLSX 的 `no_applications` 终态。保留空 `common-export.bin`、列表快照、导出请求及哈希回执；不把缺失计数、错误页或非空非 ZIP 响应当作无申请。列表为零但导出非空时保留原件；started模式交集为空，不因导出含其他申请而扩大范围。
 
 该空响应分支跳过订单、票聚商品、详情计划及 `run_invoice.py`，生成目录只写 `run.json` 和表头 `exceptions.csv`。报告数量和金额均为零，`output/common_template_output=null`，`empty_export={path, sha256, reason}` 指向原始空响应，原因是 `applications_and_export_empty`；没有可供人工核对的源工作簿，不制造替代表格。已下载 XLSX 但无待处理源行的 `no_applications` 仍交付原件副本。
 
@@ -112,9 +118,13 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 负数整票标为 `excluded_negative`，无输出明细；其他票按资料完整性判定可生成或暂缓。单独计划构建器的 `ready_for_export` 仅表示可生成文件，计划指纹不是提交去重或已开具登记。
 
+本技能不提交实际开票，也没有跨任务已开票登记。新建最近两个月批次会重新导出当时仍待处理的申请，可能与旧交付重叠；不能将不同批次文件解释为已自动去重。恢复原批次只继续其固定范围与原件快照，不把新增申请混入成功检查点。
+
 `verify_sources()` 独立复核源字段、关联和金额。Artifact Tool 按表头批量写入作者副本，再由 `template_io.py` 以原始模板为基底替换数据区；`verify_workbook()` 逐单元格核验数据及模板其他部件。通过后才发布正式文件。原模板要求全部数据文本输入，明确零税率为文本 `0`。
 
 ## 终态、交付与测试
+
+正式 CLI 的业务终态保存并释放连接/锁后，调用独立 `invoice_delivery.py` 生成 ZIP，并默认读取技能根目录的私有 `notifications.json` 推送企微；显式配置优先，旧工作目录仅在技能内未配置时兼容。打包与推送回执只写 `delivery/`，不改以下业务终态或成功文件哈希。多店在批次层调用一次；单店 CLI 在单店层调用，`OnlineRunner` 子流程不自行发消息。`--no-notify` 和离线重放只打包，`--plan-only` 不触发。发送失败单独补发，无需恢复业务采集。详见[打包与企微推送](notifications.md)。
 
 | 状态 | 含义 |
 | --- | --- |
@@ -129,7 +139,7 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 成功交付已取得的原件副本、税局模板、异常清单和报告。无可生成申请时不发布可导入税局模板；上述有完整证据的零字节导出终态改为交付查询快照、空响应证据、异常表头和报告，文件路径为 `null` 不表示失败。若采集失败，保留已取得的原件和检查点。数据/结构校验不等于视觉或税局上传通过。
 
-多店增加 `batch-state.json`、`batch-summary.json`、`batch-summary.csv`，每店产物保持独立。新批次冻结日期、选中店铺及顺序、所选账号约束、所选店铺和共享票聚的环境身份；后来新增未选中的有效店铺既不加入旧批次，也不使其恢复失配。旧 v1 批次沿用原来的全清单身份检查，不手改检查点升级。
+多店增加 `batch-state.json`、`batch-summary.json`、`batch-summary.csv`，每店产物保持独立。新批次冻结日期模式及开始/结束日期、选中店铺及顺序、所选账号约束、所选店铺和共享票聚的环境身份；后来新增未选中的有效店铺既不加入旧批次，也不使其恢复失配。旧 v1 批次沿用原来的全清单身份检查，不手改检查点升级。
 
 批次恢复在任何新浏览器请求前校验全部已完成店铺的输入/输出哈希，通过后跳过，不重新采集这些店铺；未完成店铺沿用各自的单店恢复。共享票聚、未知或未明确归类的错误停止批次，只有标为 qianniu 的明确单店环境/认证错误可记录后继续。批次状态与详情见[多店配置与运行](multi-shop.md#状态恢复与交付)。
 

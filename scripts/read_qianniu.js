@@ -2,11 +2,17 @@
   const input = __INPUT__;
   const {operation} = input;
   const timestamp = () => new Date().toISOString();
+  // Pace every actual order request, including the first page of a new
+  // batch and network retries. A delay only in the outer batch loop misses
+  // pagination and creates bursts against the sold-order endpoint.
+  const ORDER_REQUEST_INTERVAL_MS=3000;
   async function request(url, options={}) {
     for(let attempt=0;attempt<3;attempt++){
       try{
+        if(operation==='orders')await new Promise(r=>setTimeout(r,ORDER_REQUEST_INTERVAL_MS));
         const response=await fetch(url,{...options,credentials:'include',signal:AbortSignal.timeout(30000)});
         if(response.status===401||response.status===403||/login|passport/i.test(response.url))throw Error('login_required');
+        if(operation==='orders'&&response.status===429)throw Error('rate_limited');
         if([429,502,503,504].includes(response.status)&&attempt<2){await new Promise(r=>setTimeout(r,500*(attempt+1)));continue;}
         if(!response.ok)throw Error(`HTTP ${response.status}`);
         return response;
@@ -37,8 +43,36 @@
   };
   if(['applications','export'].includes(operation)){
     if(!['myseller.taobao.com','einvoice.taobao.com'].includes(location.hostname))throw Error('wrong_invoice_page');
-    if(!/^\d{4}-\d{2}-\d{2}$/.test(input.date||'')||input.agentId===undefined)throw Error('date_and_current_agentId_required');
-    const common={startTime:input.date,endTime:input.date,agentId:String(input.agentId)};
+    const validDate=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&
+      Number.isFinite(Date.parse(value+'T00:00:00Z'))&&new Date(value+'T00:00:00Z').toISOString().slice(0,10)===value;
+    let startTime=input.date,endTime=input.date;
+    const scope=input.query_scope;
+    const countdownStarted=scope?.countdown==='started';
+    const scopeKeys=keys=>Object.keys(scope).sort().join(',')===[...keys,
+      ...(Object.hasOwn(scope,'countdown')?['countdown']:[])].sort().join(',');
+    if(scope!==undefined&&(!scope||typeof scope!=='object'||Array.isArray(scope)||
+      (Object.hasOwn(scope,'countdown')&&!countdownStarted)))throw Error('invalid_query_scope');
+    if(scope?.mode==='all_pending'){
+      if(input.date!=null||!validDate(scope.start_date)||!validDate(scope.end_date)||
+        !scopeKeys(['mode','start_date','end_date']))throw Error('invalid_query_scope');
+      const end=new Date(scope.end_date+'T00:00:00Z');
+      const first=new Date(Date.UTC(end.getUTCFullYear(),end.getUTCMonth()-2,1));
+      const days=new Date(Date.UTC(first.getUTCFullYear(),first.getUTCMonth()+1,0)).getUTCDate();
+      first.setUTCDate(Math.min(end.getUTCDate(),days));
+      if(first.toISOString().slice(0,10)!==scope.start_date)throw Error('invalid_query_scope');
+      startTime=scope.start_date;endTime=scope.end_date;
+    }else if(scope?.mode==='date'){
+      if(!scopeKeys(['mode','date'])||scope.date!==input.date)throw Error('invalid_query_scope');
+    }else if(scope!==undefined){
+      throw Error('invalid_query_scope');
+    }
+    if(!validDate(startTime)||!validDate(endTime)||input.agentId===undefined)throw Error('date_and_current_agentId_required');
+    const scopeResult=scope?{date:scope.mode==='all_pending'?null:input.date,query_scope:scope}:{date:input.date};
+    // UI enum: 已开始=100, 已超时=-1, 未开始=0. Apply the exact same
+    // filter to diagnostics and the original export; remainTime is NOT this
+    // selector (the live API can return remainTime=0 on started rows).
+    const common={startTime,endTime,agentId:String(input.agentId),
+      ...(countdownStarted?{rightsRemainTime:'100'}:{})};
     if(operation==='export'){
       const response=await request('https://einvoice.taobao.com/api/invoice/batch4visitor/apply?'+new URLSearchParams({...common,pageNo:'0',pageSize:'20'}));
       const bytes=new Uint8Array(await response.arrayBuffer());
@@ -48,15 +82,15 @@
       let binary='';for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));
       // Keep the browser-session URL out of the saved checkpoint. The local
       // bridge persists only the XLSX bytes and their file hash.
-      return {status:response.status,date:input.date,queried_at:timestamp(),base64:btoa(binary)};
+      return {status:response.status,...scopeResult,queried_at:timestamp(),base64:btoa(binary)};
     }
     // The export is the authoritative source. Keep every row returned by the
     // list endpoint as a diagnostic snapshot, including rows whose status is
     // not pending; the matching common-template export decides scope.
-    const rows=[],list_non_pending_snapshot_rows=[];let api_total=null;const seen=new Set();
+    const rows=[],list_non_pending_snapshot_rows=[];let api_total=null,duplicate_snapshot_row_count=0;const seen=new Map();
     const pageSize=20;
-    const finish=()=>({date:input.date,queried_at:timestamp(),total:rows.length,api_total,
-      observed_total:seen.size,rows,list_non_pending_snapshot_rows});
+    const finish=()=>({...scopeResult,queried_at:timestamp(),total:rows.length,api_total,
+      observed_total:seen.size,rows,list_non_pending_snapshot_rows,duplicate_snapshot_row_count});
     for(let pageNo=0;pageNo<10000;pageNo++){
       const response=await request('https://einvoice.taobao.com/api/qianniu/invoice/list/apply?'+new URLSearchParams({...common,applyListType:'0',pageSize:'20',pageNo:String(pageNo)}));
       const body=await response.json();
@@ -68,12 +102,24 @@
       if(body.code!==200||!Array.isArray(body.data)||!Number.isInteger(body.total))throw Error('invalid_application_response');
       if(api_total!==null&&api_total!==body.total)throw Error('applications_changed_during_pagination');
       api_total=body.total;
+      let added=0;
       for(const row of body.data){
-        if(seen.has(row.serialNo))throw Error('duplicate_application');seen.add(row.serialNo);
-        const normalized={serialNo:row.serialNo,tid:String(row.tid),amount:row.amount,applyStatus:row.applyStatus,applyTime:row.applyTime,tradeLink:row.tradeLink};
+        if(!row.serialNo)throw Error('missing_application_id');
+        const normalized={serialNo:row.serialNo,tid:String(row.tid),amount:row.amount,applyStatus:row.applyStatus,
+          applyTime:row.applyTime??row.applyGmtCreate??row.startTime,tradeLink:row.tradeLink};
+        // The live endpoint expands related application history across page
+        // boundaries. Identical business rows can recur on adjacent pages.
+        // Keep one diagnostic row, but reject a changed record or stuck page.
+        const signature=stableStringify(normalized);
+        if(seen.has(row.serialNo)){
+          if(seen.get(row.serialNo)!==signature)throw Error('conflicting_duplicate_application');
+          duplicate_snapshot_row_count++;continue;
+        }
+        seen.set(row.serialNo,signature);added++;
         rows.push(normalized);
         if(row.applyStatus!==1)list_non_pending_snapshot_rows.push(normalized);
       }
+      if(body.data.length&&!added)throw Error('duplicate_application_page');
       // `total` is the server's pending count, while the response can also
       // contain historical/non-pending rows. Stop on a short page, or on an
       // empty page after all server-counted rows have been observed.

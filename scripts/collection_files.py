@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from run_invoice import (context_digest, load, read_source, save, select_template_rows, sha,
-                         validate_order_pages, negative_application_ids)
+                         validate_order_pages, negative_application_ids, validate_application_snapshot)
 from template_io import require
 from order_evidence import merge_order_details
+from invoice_scope import scope_from_record
 
 def save_checkpoint(path, data):
     """Never replace a successful deterministic selection checkpoint."""
@@ -60,8 +61,8 @@ def read_part(path, stage):
             '回执结构不得作为采集批次: '+path.name)
     return part
 
-def validate_order_items(items, requested):
-    """Reject incomplete order rows before their codes reach the JST stage."""
+def validate_order_items(items, requested, *, allow_missing_goods_code=False):
+    """Keep order identity strict; an absent code may need one detail read."""
     seen=set()
     for item in items:
         order=str(item.get('order_no') or '')
@@ -70,7 +71,8 @@ def validate_order_items(items, requested):
         require(sub,'订单明细缺少子订单号: '+order)
         key=(order,sub)
         require(key not in seen,'重复子订单，检查批次文件: '+str(key));seen.add(key)
-        require(str(item.get('goods_code') or '').strip(),'订单明细缺少商品编码: '+str(key))
+        if not allow_missing_goods_code:
+            require(str(item.get('goods_code') or '').strip(),'订单明细缺少商品编码: '+str(key))
         require(str(item.get('title') or '').strip(),'订单明细缺少商品标题: '+str(key))
         try: quantity=Decimal(str(item.get('quantity') or ''))
         except InvalidOperation: quantity=None
@@ -89,6 +91,12 @@ def validate_selection_scope(root, checkpoint, label):
     require(binding.get('common_template_sha256')==selection.get('common_template_sha256'),
             f'{label} 与通用模板选择范围不一致')
     require(binding.get('selection_sha256')==sha(selection_path),f'{label} 与 selection.json 不一致')
+    if 'applications_sha256' in selection:
+        applications_path=root/'applications.json'
+        require(applications_path.is_file() and sha(applications_path)==selection['applications_sha256'],
+                f'{label} 与开票倒计时申请列表不一致')
+        require(scope_from_record(load(applications_path))==selection.get('query_scope'),
+                f'{label} 与开票倒计时查询范围不一致')
     if binding.get('context_sha256'):
         context_path=root/'capture_context.json'
         require(context_path.is_file(),f'{label} 缺少页面主体上下文')
@@ -102,22 +110,19 @@ def main():
     p.add_argument('--part',action='append',type=Path,default=[])
     args=p.parse_args();root=args.run_dir
     if args.stage=='orders':
-        apps=load(root/'applications.json');live_rows=apps['rows']
-        live_ids=[row.get('serialNo') for row in live_rows]
-        require(all(live_ids) and len(live_ids)==len(set(live_ids)),'申请列表流水号重复或为空')
-        current_snapshot='list_non_pending_snapshot_rows' in apps
-        diagnostics=apps.get('list_non_pending_snapshot_rows',apps.get('excluded_non_pending_rows',[]))
-        diagnostic_ids=[row.get('serialNo') for row in diagnostics]
-        require(all(diagnostic_ids) and len(diagnostic_ids)==len(set(diagnostic_ids)),
-                '申请列表非待处理快照记录重复或为空')
-        live={row['serialNo']:row for row in live_rows}
-        if current_snapshot:
-            require(set(diagnostic_ids)<=set(live_ids),'申请列表非待处理快照不属于观察行')
-        else:
-            for app in diagnostics: live.setdefault(app['serialNo'],app)
-        require(len(live)==apps.get('observed_total',apps['total']),'申请分页不完整')
+        apps=load(root/'applications.json')
+        live=validate_application_snapshot(apps)
+        scope=scope_from_record(apps)
+        context_path=root/'capture_context.json'
+        context=load(context_path) if context_path.exists() else None
+        if 'countdown' in scope:
+            require(context is not None,'开票倒计时筛选缺少页面查询范围证据')
+            require(scope_from_record(context)==scope,'申请列表查询范围与页面上下文不一致')
+        if context is not None and (context.get('date') or 'query_scope' in context):
+            require(scope_from_record(context)==scope,'申请列表查询范围与页面上下文不一致')
         rows=read_source(root/'qianniu_common.xlsx')
-        pending,ignored,selection=select_template_rows(rows,root/'qianniu_common.xlsx')
+        pending,ignored,selection=select_template_rows(rows,root/'qianniu_common.xlsx',scope,
+                                                     applications_path=root/'applications.json')
         selection_path=root/'selection.json';save_checkpoint(selection_path,selection)
         for row in pending:
             app=live.get(row['申请流水号'])
@@ -126,8 +131,7 @@ def main():
         excluded_negative=negative_application_ids(selected_source_rows)
         active_pending=[row for row in pending if row['申请流水号'] not in excluded_negative]
         orders=list(dict.fromkeys(r['订单编号'] for r in active_pending))
-        context_path=root/'capture_context.json'
-        context_hash=context_digest(load(context_path)) if context_path.exists() else None
+        context_hash=context_digest(context) if context is not None else None
         order_ids={
             'common_template_sha256':selection['common_template_sha256'],
             'selection_sha256':sha(selection_path),
@@ -159,14 +163,17 @@ def main():
         order_ids=load(root/'order_ids.json');binding=validate_selection_scope(root,order_ids,'订单清单')
         requested=order_ids['orders'];found={i['order_no'] for i in items}
         validate_order_pages(batches,requested)
-        validate_order_items(items, set(requested))
+        validate_order_items(items, set(requested), allow_missing_goods_code=True)
         require(found<=set(requested),'返回未请求订单')
         all_items,_,detail_orders=merge_order_details(root,items,requested)
-        validate_order_items(all_items, set(requested))
+        validate_order_items(all_items, set(requested), allow_missing_goods_code=True)
+        missing_codes={str(i['order_no']) for i in all_items if not str(i.get('goods_code') or '').strip()}
+        codes=[str(i.get('goods_code') or '').strip() for i in all_items]
         manifest=record_parts_manifest(root,'orders',args.part,publish=False)
         atomic_save(root/'order_batches.json',{**binding,'queried_at':datetime.now(timezone.utc).isoformat(),'batches':batches,'items':items,
-                                               'missing':[o for o in requested if o not in found]})
-        atomic_save(root/'goods_codes.json',{**binding,'codes':list(dict.fromkeys(i['goods_code'] for i in all_items if i['goods_code']))})
+                                               'missing':[o for o in requested if o not in found],
+                                               'missing_goods_code_orders':[o for o in requested if o in missing_codes]})
+        atomic_save(root/'goods_codes.json',{**binding,'codes':list(dict.fromkeys(code for code in codes if code))})
         atomic_save(root/'parts_manifest.json',manifest)
         unresolved=set(requested)-found-detail_orders
         print(f'{len(found)} orders found in batches; {len(detail_orders-found)} resolved by details; {len(unresolved)} unresolved')

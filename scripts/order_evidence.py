@@ -92,8 +92,7 @@ def merge_order_details(root, batch_items, requested):
                 require(key[0]==order and key[1], '订单详情子订单标识缺失或订单不一致: '+str(key))
                 quantity=number(item.get('quantity'))
                 require(quantity is not None and quantity>0,'订单详情数量无效: '+str(key))
-                require(bool(text(item.get('goods_code'))) and bool(text(item.get('title'))),
-                        '订单详情缺少商品编码或标题: '+str(key))
+                require(bool(text(item.get('title'))), '订单详情缺少商品标题: '+str(key))
                 require(key not in seen,'同一详情响应重复子订单: '+str(key));seen.add(key)
                 if key in merged:
                     previous=merged[key]
@@ -138,7 +137,7 @@ def derive_amount_evidence(details, source_rows):
         url_order=parse_qs(parsed.query).get('bizOrderId',[])
         raw_match=re.fullmatch(r'\s*[¥￥]?\s*((?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?)\s*[xX×]\s*([0-9]+(?:\.[0-9]+)?)\s*',
                                str(item.get('price_cell') or ''))
-        valid=(item.get('source')=='order_detail_dom' and parsed.hostname in {'qn.taobao.com','trade.taobao.com'}
+        valid=(bool(text(item.get('goods_code'))) and item.get('source')=='order_detail_dom' and parsed.hostname in {'qn.taobao.com','trade.taobao.com'}
                and url_order==[key[0]] and bool(document.get('queried_at'))
                and price is not None and price>0 and quantity is not None and quantity>0
                and raw_match and number(raw_match[1])==price and number(raw_match[2])==quantity)

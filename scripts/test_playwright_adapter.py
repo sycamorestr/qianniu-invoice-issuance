@@ -149,7 +149,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
         self.assertEqual(error.exception.site, "qianniu")
         create.assert_not_called()
 
-    def test_detail_waits_for_exact_order_and_ready_goods_code_row(self):
+    def test_detail_waits_for_exact_order_and_complete_runtime_rows(self):
         order_no = "9000000000000000001"
         page = FakePage()
         controller = FakeController(
@@ -158,9 +158,10 @@ class PlaywrightAdapterTests(unittest.TestCase):
         )
         runner = make_runner(controller)
 
-        value = asyncio.run(runner._invoke_async(
-            "qianniu", "detail", {"order_no": order_no}, False
-        ))
+        with patch.object(playwright_adapter.asyncio, "sleep", new_callable=AsyncMock):
+            value = asyncio.run(runner._invoke_async(
+                "qianniu", "detail", {"order_no": order_no}, False
+            ))
 
         self.assertEqual(value["order_no"], order_no)
         self.assertEqual(len(page.goto_calls), 2)
@@ -174,7 +175,108 @@ class PlaywrightAdapterTests(unittest.TestCase):
         self.assertIn("querySelectorAll('tr')", expression)
         self.assertIn("商家编码", expression)
         self.assertIn("__reactFiber$", expression)
+        self.assertIn("runtime_order_snapshot_conflict", expression)
+        self.assertIn("goods_code_missing", expression)
         self.assertEqual(controller.evaluate_calls[0][1].name, "read_order_detail.js")
+
+    def test_verified_empty_goods_code_is_preserved_and_orders_page_restored(self):
+        order_no = "9000000000000000001"
+        page = FakePage()
+        evidence = {"order_no": order_no, "verified_order": True, "items": [{
+            "order_no": order_no, "sub_order_no": order_no, "title": "补差价测试",
+            "quantity": "4800", "goods_code": "", "goods_code_missing": True,
+            "price_cell": "0.01\n\nx4800", "unit_price": "0.01",
+        }]}
+        runner = make_runner(FakeController(page, evidence))
+        with patch.object(playwright_adapter.asyncio, "sleep", new_callable=AsyncMock):
+            value = asyncio.run(runner._invoke_async("qianniu", "detail", {"order_no": order_no}, False))
+        self.assertEqual(value, evidence)
+        self.assertEqual(len(page.wait_calls), 1)
+        self.assertEqual([url for url, _ in page.goto_calls], [
+            f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_no}", ORDERS_URL])
+
+    def test_incomplete_detail_wait_failure_leaves_page_without_more_requests(self):
+        page = FakePage()
+        page.wait_for_function = AsyncMock(side_effect=TimeoutError("incomplete DOM/runtime"))
+        controller = FakeController(page, None)
+        runner = make_runner(controller)
+        with patch.object(playwright_adapter.asyncio, "sleep", new_callable=AsyncMock) as delay, \
+                self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
+            asyncio.run(runner._invoke_async("qianniu", "detail", {"order_no": "9000000000000000001"}, False))
+        self.assertEqual(error.exception.code, "request_failed")
+        self.assertEqual(controller.evaluate_calls, [])
+        self.assertEqual(len(page.goto_calls), 1)
+        self.assertIn("bizOrderId=9000000000000000001", page.url)
+        delay.assert_awaited_once_with(3)
+
+    def test_consecutive_details_wait_before_each_navigation(self):
+        order_ids = ("9000000000000000001", "9000000000000000002")
+        events = []
+        clock = 0
+        page = FakePage()
+        controller = FakeController(page, None)
+        runner = make_runner(controller)
+
+        async def delay(seconds):
+            nonlocal clock
+            events.append(("wait", seconds))
+            clock += seconds
+
+        async def navigate(url, **kwargs):
+            events.append(("navigate", clock, url))
+            await FakePage.goto(page, url, **kwargs)
+
+        async def collect(role, source, payload):
+            events.append(("collect", clock, payload["order_no"]))
+            return {"order_no": payload["order_no"], "verified_order": True, "items": []}
+
+        page.goto = AsyncMock(side_effect=navigate)
+        controller.evaluate_file = AsyncMock(side_effect=collect)
+
+        async def exercise():
+            for order_no in order_ids:
+                await runner._invoke_async("qianniu", "detail", {"order_no": order_no}, False)
+
+        with patch.object(playwright_adapter.asyncio, "sleep", side_effect=delay):
+            asyncio.run(exercise())
+
+        self.assertEqual(events, [
+            ("wait", 3),
+            ("navigate", 3, f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_ids[0]}"),
+            ("collect", 3, order_ids[0]),
+            ("wait", 3), ("navigate", 6, ORDERS_URL),
+            ("wait", 3),
+            ("navigate", 9, f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_ids[1]}"),
+            ("collect", 9, order_ids[1]),
+            ("wait", 3), ("navigate", 12, ORDERS_URL),
+        ])
+
+    def test_detail_navigation_or_collection_failure_never_restores_page(self):
+        for failure_at in ("goto", "collector"):
+            with self.subTest(failure_at=failure_at):
+                page = FakePage()
+                controller = FakeController(page, None)
+                runner = make_runner(controller)
+                if failure_at == "goto":
+                    page.goto = AsyncMock(side_effect=TimeoutError("navigation failed"))
+                else:
+                    controller.evaluate_file = AsyncMock(side_effect=BrowserControllerError(
+                        "Page.evaluate: Error: rate_limited", "script_failed"))
+                with patch.object(playwright_adapter.asyncio, "sleep", new_callable=AsyncMock) as delay, \
+                        self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
+                    asyncio.run(runner._invoke_async(
+                        "qianniu", "detail", {"order_no": "9000000000000000001"}, False))
+                delay.assert_awaited_once_with(3)
+                if failure_at == "goto":
+                    page.goto.assert_awaited_once()
+                    self.assertEqual(controller.evaluate_calls, [])
+                    self.assertEqual(page.wait_calls, [])
+                    self.assertEqual(error.exception.code, "request_failed")
+                else:
+                    self.assertEqual(len(page.goto_calls), 1)
+                    self.assertIn("bizOrderId=9000000000000000001", page.url)
+                    self.assertEqual(error.exception.code, "rate_limited")
+                self.assertEqual(error.exception.site, "qianniu")
 
     def test_orders_rejects_non_string_request_before_page_script(self):
         page = FakePage()
@@ -223,6 +325,20 @@ class PlaywrightAdapterTests(unittest.TestCase):
         ))
 
         self.assertIs(value, response)
+
+    def test_order_rate_limit_is_typed_and_stops_after_one_collection_attempt(self):
+        page = FakePage()
+        source = BrowserControllerError("Page.evaluate: Error: rate_limited", "script_failed")
+        controller = FakeController(page, None)
+        controller.evaluate_file = AsyncMock(side_effect=source)
+        runner = make_runner(controller)
+        with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
+            asyncio.run(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+        self.assertEqual(error.exception.code, "rate_limited")
+        self.assertEqual(error.exception.site, "qianniu")
+        self.assertIs(error.exception.__cause__, source)
+        controller.evaluate_file.assert_awaited_once()
+        self.assertEqual(page.goto_calls, [])
 
     def test_goods_query_uses_frame_and_structured_result(self):
         response = {"ok": True, "data": [{"input_goods_code": "TEST-SKU"}]}
@@ -275,6 +391,27 @@ class PlaywrightAdapterTests(unittest.TestCase):
         self.assertTrue(future.cancelled)
         runner.close.assert_called_once()
         self.assertEqual(error.exception.code, "request_failed")
+
+    def test_sync_operations_allow_pacing_without_relaxing_unrelated_watchdogs(self):
+        with tempfile.TemporaryDirectory() as root:
+            input_path = Path(root) / "input.json"
+            input_path.write_text("{}", encoding="utf-8")
+            output_path = Path(root) / "output.json"
+            runner = make_runner(FakeController(FakePage(), None))
+            runner.progress = Mock()
+            # A plain sentinel avoids creating an unawaited coroutine while
+            # exercising the public adapter entry point and actual _call.
+            runner._invoke_async = Mock(return_value=object())
+            cases = (("qianniu", "orders", 120), ("qianniu", "detail", 90),
+                     ("qianniu", "applications", 60), ("jst", "query", 60))
+            for site, operation, expected_timeout in cases:
+                with self.subTest(site=site, operation=operation):
+                    future = Mock()
+                    future.result.return_value = {"test": True}
+                    with patch.object(asyncio, "run_coroutine_threadsafe", return_value=future):
+                        result = runner(site, operation, input_path, output_path)
+                    future.result.assert_called_once_with(timeout=expected_timeout)
+                    self.assertEqual(result["payload"], {"test": True})
 
     def test_split_browser_configuration_rejects_mixed_roles_or_shared_data_root(self):
         with tempfile.TemporaryDirectory() as root:
@@ -484,7 +621,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
             await runner._invoke_async("jst", "query", {"codes": ["TEST-SKU"]}, False)
             return qianniu, jst
 
-        qianniu, jst = asyncio.run(exercise())
+        with patch.object(playwright_adapter.asyncio, "sleep", new_callable=AsyncMock):
+            qianniu, jst = asyncio.run(exercise())
         self.assertEqual(qianniu["browser_pages"], {"invoice": "shop-invoice", "orders": "shop-orders"})
         self.assertEqual(jst["browser_pages"], {"goods": "shared-goods"})
         self.assertEqual(jst["issuer"], "示例公司")
@@ -508,6 +646,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
         tokens = {
             "login_required": "auth_required",
             "permission_required": "permission_required",
+            "rate_limited": "rate_limited",
             "context_changed_store": "context_changed",
             "context_changed_account": "context_changed",
             "context_missing_store": "context_missing",
@@ -540,6 +679,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
             "Page.evaluate: Error: upstream response mentions login_required",
             "Page.evaluate: Error: 'login_required'",
             "Page.evaluate: Error: login_required: unrelated details",
+            "Page.evaluate: Error: rate_limited_extra",
         )
         for message in messages:
             with self.subTest(message=message):

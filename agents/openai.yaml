@@ -1,4 +1,4 @@
 interface:
   display_name: "千牛税局模板生成"
-  short_description: "按千牛申请日期关联订单商品与聚水潭票据，生成并校验税局模板表格"
-  default_prompt: "使用 $qianniu-invoice-issuance 按指定申请日期生成税局开票模板表格和异常清单。"
+  short_description: "按指定日期或最近两个月待处理申请，关联订单和票聚商品生成税局模板"
+  default_prompt: "使用 $qianniu-invoice-issuance 处理最近两个月全部待处理申请，生成税局模板、原始通用模板副本和异常清单。"

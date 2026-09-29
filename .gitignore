@@ -13,6 +13,9 @@ profiles/
 shops.json
 shops.*.json
 !assets/shops.example.json
+notifications.json
+notifications.*.json
+!assets/notifications.example.json
 shop-input.json
 data/
 downloads/

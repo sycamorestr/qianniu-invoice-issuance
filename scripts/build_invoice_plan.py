@@ -221,8 +221,7 @@ def make_order_items_index(rows: list[dict[str, Any]]) -> dict[str, list[dict[st
     result: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         order_no = normalize_identifier(value(row, "order_no"))
-        goods_code = normalize_identifier(value(row, "goods_code"))
-        if order_no and goods_code:
+        if order_no:
             result[order_no].append(row)
     return result
 
@@ -299,6 +298,9 @@ def resolve_goods_code(
         build.error(f"源行 {source_row} 的商品编码 {direct} 不属于订单 {order_no} 的查询结果")
         return None
     items = list(enumerate((order_items or {}).get(order_no, [])))
+    if any(not normalize_identifier(value(item, "goods_code")) for _, item in items):
+        build.error(f"源行 {source_row} 的订单 {order_no} 明细缺少商家编码，不能确认商品关联")
+        return None
     if items:
         matches = []
         amount_conflict = False

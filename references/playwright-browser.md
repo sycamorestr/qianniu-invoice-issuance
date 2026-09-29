@@ -37,10 +37,10 @@
 - 启动时缺页只恢复一次，不重复打开已有页，不关闭空白页或用户无关标签，不循环增加页面。
 - 登录跳转、验证码或权限问题不能当缺页处理。页面存在、URL 无 login 只是定位线索，正式采集仍须正向核对店铺、公司和租户标识。
 - 已登记页面中途失效时，在同一个 context 找回符合角色的现有页；找不到则 `page_missing`，停止并保留检查点。
-- 订单详情仅在必要时复用订单页，读取结束恢复列表；不逐单新开详情标签。
+- 订单详情仅在必要时复用订单页，前往和成功返回列表前各等待3秒；失败保留当前页面供检查或人工验证，不额外导航。显式恢复时按原页面规则复用或补齐列表；不逐单新开详情标签。
 - 采集中途浏览器断连返回 `browser_disconnected`，保留检查点，不循环启动浏览器或切换其他 Profile。修复后恢复原任务；默认恢复入口仍可按原配置启动已关闭环境。
 
-常见错误包括 `login_required` / `auth_required`、`context_missing`、`context_changed` / `context_mismatch`、`page_missing`、`profile_locked`。按错误码报告原因；解决后恢复原任务。详细接口证据见[页面接入](page-integration.md)。
+常见错误包括 `login_required` / `auth_required`、`rate_limited`、`context_missing`、`context_changed` / `context_mismatch`、`page_missing`、`profile_locked`。订单HTTP 429的 `rate_limited` 停止整批，不自动继续其他店。按错误码报告原因；解决后恢复原任务。验证码未必有专用错误码，也可能体现为响应格式错误或详情就绪超时，不能循环尝试。详细接口证据见[页面接入](page-integration.md)。
 
 ## 配置与多店
 

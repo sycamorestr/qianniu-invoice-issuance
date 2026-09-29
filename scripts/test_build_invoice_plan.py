@@ -62,6 +62,17 @@ def build(source: dict) -> dict:
     return MODULE.build_invoice(MODULE.InvoiceBuild("A-1", groups["A-1"]), order_index, jst_index, run, order_items)
 
 
+def test_missing_code_sibling_cannot_be_dropped_to_claim_unique_match() -> None:
+    source = valid_source()
+    source['order_items'] = [
+        {'order_no': 'O-1', 'goods_code': 'SKU-1', 'sub_order_no': 'S-1', 'quantity': '7'},
+        {'order_no': 'O-1', 'goods_code': '', 'sub_order_no': 'S-2', 'quantity': '7'},
+    ]
+    invoice = build(source)
+    assert any('缺少商家编码' in error for error in invoice['errors']), invoice
+    assert invoice['status'] != 'ready_for_export'
+
+
 def test_valid_positive_and_discount() -> None:
     invoice = build(valid_source())
     assert invoice["errors"] == [], invoice["errors"]

@@ -9,12 +9,13 @@ import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zipfile import ZipFile
 
 import build_invoice_plan as rules
+from invoice_scope import make_scope, resolve_scope, scope_from_record, scope_label, scope_fields, scope_date_range
 from order_evidence import merge_order_details, derive_amount_evidence, attach_amount_evidence
 from template_io import (BASIC, DETAIL, SHEETS, inspect_template, make_output_rows,
                          is_ready_for_export, prepare, finalize, read_rows, require, sheet_paths, Q, ET)
@@ -66,8 +67,34 @@ def negative_application_ids(rows):
             excluded.add(serial)
     return excluded
 
-def select_template_rows(rows, common_template):
-    """Select only exact pending export rows and retain an auditable summary."""
+def validate_application_snapshot(applications):
+    """Validate the full observed membership without treating status as a filter."""
+    live=applications['rows']
+    current_snapshot='list_non_pending_snapshot_rows' in applications
+    diagnostics=applications.get('list_non_pending_snapshot_rows',applications.get('excluded_non_pending_rows',[]))
+    api_total=applications.get('api_total',applications['total'])
+    observed_total=applications.get('observed_total',applications['total'])
+    require(isinstance(live,list) and isinstance(diagnostics,list),'申请列表结构无效')
+    require(type(api_total) is int and api_total>=0 and type(observed_total) is int and observed_total>=0,
+            '申请列表计数无效')
+    live_ids=[row.get('serialNo') for row in live]
+    require(all(live_ids) and len(live_ids)==len(set(live_ids)),'申请列表流水号重复或为空')
+    diagnostic_ids=[row.get('serialNo') for row in diagnostics]
+    require(all(diagnostic_ids) and len(diagnostic_ids)==len(set(diagnostic_ids)),
+            '申请列表非待处理快照记录重复或为空')
+    observed={row['serialNo']:row for row in live}
+    if current_snapshot:
+        require(set(diagnostic_ids)<=set(live_ids),'申请列表非待处理快照不属于观察行')
+    else:
+        for row in diagnostics:
+            observed.setdefault(row['serialNo'],row)
+    require(observed_total==len(observed),'申请列表分页不完整或重复')
+    require(bool(applications.get('queried_at')),'申请列表缺少采集时间')
+    return observed
+
+
+def select_template_rows(rows, common_template, query_scope=None, *, applications_path=None):
+    """Select pending export rows, intersecting verified countdown membership."""
     pending=[];ignored=[];status_counts=Counter()
     for row in rows:
         status=template_status(row)
@@ -77,6 +104,37 @@ def select_template_rows(rows, common_template):
             pending.append(row)
         else:
             ignored.append(row)
+    countdown_audit={}
+    if query_scope is not None and 'countdown' in query_scope:
+        require(query_scope.get('countdown')=='started','开票倒计时筛选仅支持 started')
+        require(applications_path is not None and Path(applications_path).is_file(),
+                '开票倒计时筛选缺少完整申请列表证据')
+        applications=load(applications_path)
+        require(scope_from_record(applications)==query_scope,'开票倒计时筛选与申请列表查询范围不一致')
+        validate_application_snapshot(applications)
+        require(all(type(applications.get(key)) is int and applications[key]>=0
+                    for key in ('total','api_total','observed_total')),
+                '开票倒计时申请列表缺少有效完整计数')
+        require(applications['observed_total']==applications['total'] and
+                applications['observed_total']>=applications['api_total'],
+                '开票倒计时申请列表分页不完整')
+        # The export endpoint currently ignores rightsRemainTime. Use the
+        # complete filtered list's membership, never applyStatus/remainTime.
+        eligible={row['serialNo'] for row in applications['rows']}
+        raw_pending=pending
+        pending=[row for row in raw_pending if row['申请流水号'] in eligible]
+        excluded=[row for row in raw_pending if row['申请流水号'] not in eligible]
+        countdown_audit={
+            'query_scope':dict(query_scope),
+            'applications_sha256':sha(applications_path),
+            'raw_pending_source_row_count':len(raw_pending),
+            'raw_pending_application_ids':list(dict.fromkeys(row['申请流水号'] for row in raw_pending)),
+            'filtered_out_countdown_application_ids':list(dict.fromkeys(row['申请流水号'] for row in excluded)),
+            'filtered_out_countdown_rows':[
+                {'source_row':row['__source_row'],'serialNo':row['申请流水号'],'status':template_status(row)}
+                for row in excluded
+            ],
+        }
     selected=list(dict.fromkeys(row['申请流水号'] for row in pending))
     selection={
         'common_template':'qianniu_common.xlsx',
@@ -91,6 +149,9 @@ def select_template_rows(rows, common_template):
             for row in ignored
         ],
     }
+    # Preserve old checkpoint bytes. New selection hashes bind both the
+    # untouched broad export and the complete countdown-filtered list.
+    selection.update(countdown_audit)
     return pending,ignored,selection
 
 def validate_selection_binding(checkpoint, selection, selection_path, label):
@@ -160,11 +221,37 @@ def validate_order_pages(batches,requested):
         require(len(found)==len(set(found))==next(iter(totals)) and set(found)<=set(ids),'订单分页返回集合不完整')
     require(queried==set(requested),'尚有订单未完成批量查询')
 
+def scope_from_args(args):
+    """Inherit both date ranges and filters from the collected snapshot."""
+    all_pending=getattr(args,'all_pending',False)
+    saved=None
+    for name in ('capture_context.json','applications.json'):
+        path=args.input_dir/name
+        if path.is_file():
+            candidate=load(path)
+            if name=='capture_context.json' and not candidate.get('date') and 'query_scope' not in candidate:
+                continue
+            saved=candidate
+            break
+    if all_pending:
+        require(saved is not None,'全部待处理生成缺少已采集的查询范围')
+    return resolve_scope(args.date,all_pending,saved=saved)
+
 def assemble(args, common_template=None):
     root=args.input_dir
-    if not args.replay:
+    scope=scope_from_args(args)
+    context_path=root/'capture_context.json'
+    if 'countdown' in scope:
+        require(context_path.is_file(),'开票倒计时筛选缺少页面查询范围证据')
+        require(scope_from_record(load(context_path))==scope,'开票倒计时筛选与页面查询范围不一致')
+    if not args.replay or context_path.exists():
         context=load(root/'capture_context.json')
-        require(context.get('date')==args.date and context.get('store')==args.store and context.get('issuer')==args.issuer,
+        # Historical replay contexts can contain identity only. Explicit scope
+        # evidence still binds the replay and must never be ignored.
+        if not args.replay or context.get('date') or 'query_scope' in context:
+            require(scope_from_record(context)==scope,'页面查询范围与运行参数不一致')
+    if not args.replay:
+        require(context.get('store')==args.store and context.get('issuer')==args.issuer,
                 '本次页面主体记录与运行参数不一致')
         require(bool(context.get('verified_at')) and bool(context.get('invoice_url')) and bool(context.get('jst_url')),
                 '缺少本次页面主体核对证据')
@@ -172,37 +259,14 @@ def assemble(args, common_template=None):
             require(context['context_sha256']==context_digest(context),'页面主体上下文哈希不一致')
     common_template=Path(common_template or root/'qianniu_common.xlsx')
     rows=read_source(common_template)
-    pending_rows,ignored_rows,selection=select_template_rows(rows,common_template)
+    pending_rows,ignored_rows,selection=select_template_rows(rows,common_template,scope,
+                                                             applications_path=root/'applications.json')
     selection_path=root/'selection.json'
     if selection_path.exists():
         require(load(selection_path)==selection,'通用模板选择检查点与原始文件不一致')
     applications=load(root/'applications.json')
-    require(applications.get('date')==args.date,'申请列表日期与本次日期不一致')
-    live=applications['rows']
-    current_snapshot='list_non_pending_snapshot_rows' in applications
-    list_non_pending=applications.get('list_non_pending_snapshot_rows',applications.get('excluded_non_pending_rows',[]))
-    api_total=applications.get('api_total',applications['total'])
-    observed_total=applications.get('observed_total',applications['total'])
-    require(isinstance(live,list) and isinstance(list_non_pending,list),'申请列表结构无效')
-    require(isinstance(api_total,int) and api_total>=0 and isinstance(observed_total,int) and observed_total>=0,
-            '申请列表计数无效')
-    live_ids=[row.get('serialNo') for row in live]
-    require(all(live_ids) and len(live_ids)==len(set(live_ids)),'申请列表流水号重复或为空')
-    snapshot_ids=[row.get('serialNo') for row in list_non_pending]
-    require(all(snapshot_ids) and len(snapshot_ids)==len(set(snapshot_ids)),'申请列表非待处理快照记录重复或为空')
-    observed={row['serialNo']:row for row in live}
-    if current_snapshot:
-        require(set(snapshot_ids)<=set(live_ids),'申请列表非待处理快照不属于观察行')
-    else:
-        # Older checkpoints retained pending rows separately from the legacy
-        # diagnostic subset, so rebuild their observed union for compatibility.
-        for row in list_non_pending:
-            observed.setdefault(row['serialNo'],row)
-    require(observed_total==len(observed),
-            '申请列表分页不完整或重复')
-    # The list endpoint is diagnostic only. Its status values and total can
-    # change independently of the export, so they must never gate selection.
-    require(bool(applications.get('queried_at')),'申请列表缺少采集时间')
+    require(scope_from_record(applications)==scope,'申请列表查询范围与本次范围不一致')
+    observed=validate_application_snapshot(applications)
     selected=selection['selected_application_ids']
     selected_source_rows=[row for row in rows if row.get('申请流水号') in selection['selected_application_ids']]
     excluded_negative=negative_application_ids(selected_source_rows)
@@ -228,7 +292,10 @@ def assemble(args, common_template=None):
             require(str(app['tid'])==row['订单编号'],'申请列表与通用模板订单不一致')
     # Source order is authoritative, independent of list-page ordering.
     if not selected:
-        return {'run':{'mode':'preview','store_name':args.store},'selected_application_ids':[],
+        empty_run={'mode':'preview','store_name':args.store}
+        if scope_fields(scope):
+            empty_run.update(**scope_fields(scope),apply_date_range=scope_date_range(scope))
+        return {'run':empty_run,'selected_application_ids':[],
                 'template_rows':pending_rows,'ignored_template_rows':ignored_rows,
                 'order_items':[],'order_goods':[],'jst_invoice_goods':[],'selection':selection}
     # Negative applications stay in the selected scope for plan accounting,
@@ -236,7 +303,7 @@ def assemble(args, common_template=None):
     # all-negative run to finish without creating empty query files.
     if not active_pending_rows:
         return {'run':{'mode':'preview','run_id':args.output_dir.name,
-                       'apply_date_range':{'start':args.date,'end':args.date},
+                       'apply_date_range':scope_date_range(scope),**scope_fields(scope),
                        'store_name':args.store,'issuer_name':args.issuer,
                        'application_snapshot_at':applications['queried_at']},
                 'selected_application_ids':selected,'template_rows':pending_rows,
@@ -258,7 +325,8 @@ def assemble(args, common_template=None):
         require(key not in seen,'重复订单明细: '+str(key));seen.add(key)
         goods_code=str(item.get('goods_code') or '').strip()
         title=str(item.get('title') or '').strip()
-        require(goods_code,'订单明细缺少商品编码: '+str(key))
+        # Retain missing-code rows: the planner blocks their whole invoice,
+        # while unrelated complete orders can still be generated.
         require(title,'订单明细缺少商品标题: '+str(key))
         try: quantity=Decimal(str(item.get('quantity') or ''))
         except InvalidOperation: quantity=None
@@ -270,9 +338,9 @@ def assemble(args, common_template=None):
     derived_evidence,evidence_diagnostics=derive_amount_evidence(detail_evidence,active_pending_rows)
     evidence=load(root/'match_evidence.json') if (root/'match_evidence.json').exists() else []
     attach_amount_evidence(normalized,[*evidence,*derived_evidence])
-    jst=load(root/'jst_query.json')
-    validate_selection_binding(jst,selection,selection_path,'票聚批次')
     codes={i['goods_code'] for i in normalized if i['goods_code']}
+    jst=load(root/'jst_query.json') if codes or (root/'jst_query.json').exists() else {'data':[]}
+    validate_selection_binding(jst,selection,selection_path,'票聚批次')
     responses=jst['data'];requested=[r['input_goods_code'] for r in responses]
     require(len(requested)==len(set(requested)) and codes<=set(requested),'票聚查询集合不完整或重复')
     require(not any(r.get('reason')=='request_failed' for r in responses),'票聚请求失败，需补查后再生成')
@@ -296,7 +364,7 @@ def assemble(args, common_template=None):
                             if paren_width_key(row.get('sku_id'))==paren_width_key(r['input_goods_code'])]
                 require(len(candidates)==1 and candidates[0]==match,'票聚规范化候选不唯一或匹配证据被改写')
             goods.append({**match,'_input_goods_code':r['input_goods_code'],'_match_basis':basis})
-    return {'run':{'mode':'preview','run_id':args.output_dir.name,'apply_date_range':{'start':args.date,'end':args.date},
+    return {'run':{'mode':'preview','run_id':args.output_dir.name,'apply_date_range':scope_date_range(scope),**scope_fields(scope),
                    'store_name':args.store,'issuer_name':args.issuer,'application_snapshot_at':applications['queried_at']},
             'selected_application_ids':selected,'template_rows':pending_rows,'order_items':normalized,
             'order_goods':[{'order_no':i['order_no'],'goods_code':i['goods_code']} for i in normalized],
@@ -309,6 +377,10 @@ def build_plan(source,output):
                            '--output',str(output/'invoice_plan.json')],check=False)
     require(result.returncode in {0,1},'计划构建失败')
     plan=load(output/'invoice_plan.json')
+    query_scope=source.get('run',{}).get('query_scope')
+    if isinstance(query_scope,dict):
+        plan.update(**scope_fields(query_scope),apply_date_range=scope_date_range(query_scope))
+        save(output/'invoice_plan.json',plan)
     require(not plan['fatal'] and not plan['errors'],'全局数据错误: '+str(plan['errors']))
     require(len(plan['invoices'])==len(source['selected_application_ids']),'申请集合不完整')
     return plan
@@ -457,21 +529,27 @@ def verify_workbook(template,output,schema,expected):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--date',required=True);p.add_argument('--store',required=True);p.add_argument('--issuer',required=True)
+    query=p.add_mutually_exclusive_group(required=True)
+    query.add_argument('--date')
+    query.add_argument('--all-pending',action='store_true',help='使用采集时冻结的最近两个月范围，按通用模板待处理状态选择')
+    p.add_argument('--store',required=True);p.add_argument('--issuer',required=True)
     p.add_argument('--input-dir',required=True,type=Path);p.add_argument('--output-dir',required=True,type=Path)
     p.add_argument('--template',type=Path,default=DEFAULT_TEMPLATE,help='可选；默认使用skill内置V260401税局模板')
     p.add_argument('--node',type=Path);p.add_argument('--node-modules',type=Path)
     p.add_argument('--plan-only',action='store_true')
     p.add_argument('--replay',action='store_true',help='离线重放历史快照，不声明当前页面状态')
-    args=p.parse_args();date.fromisoformat(args.date)
+    args=p.parse_args()
+    label='all-pending' if args.all_pending else scope_label(make_scope(args.date))
     args.output_dir.mkdir(parents=True,exist_ok=False)
     manifest={'date':args.date,'store':args.store,'issuer':args.issuer,'started_at':datetime.now(timezone.utc).isoformat(),
               'stage':'inputs','status':'running','replay':args.replay,'inputs':{}}
     try:
         # Publish the browser-exported original before any downstream input or
         # template check so even a failed build remains manually reconcilable.
-        common_output=publish_common_template(args.input_dir,args.output_dir,args.date)
+        common_output=publish_common_template(args.input_dir,args.output_dir,label)
         manifest['common_template_output']={'path':str(common_output.resolve()),'sha256':sha(common_output)}
+        scope=scope_from_args(args)
+        manifest.update(**scope_fields(scope))
         context_path=args.input_dir/'capture_context.json'
         if context_path.exists():
             context=load(context_path)
@@ -517,7 +595,7 @@ def main():
             pending=args.output_dir/'invoice.pending.xlsx'
             finalize(args.template,authored,pending,schema)
             changed=verify_workbook(args.template,pending,schema,expected)
-            final=args.output_dir/f'qianniu_invoice_tax_template_{args.date}.xlsx'
+            final=args.output_dir/f'qianniu_invoice_tax_template_{label}.xlsx'
             pending.rename(final)
             manifest.update(stage='verified',status='complete',output=str(final.resolve()),output_sha256=sha(final),
                             detail_rows=len(expected[SHEETS[1]]),changed_parts=changed,

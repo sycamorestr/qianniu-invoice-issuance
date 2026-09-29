@@ -12,11 +12,13 @@ import io
 import os
 import tempfile
 import unittest
+from datetime import date as calendar_date
 from pathlib import Path
 from unittest.mock import patch
 from zipfile import ZipFile
 
 import run_online
+import invoice_scope
 
 
 class FakeAdapter:
@@ -47,7 +49,8 @@ class FakeAdapter:
 
 class RunOnlineTests(unittest.TestCase):
     def make_runner(self, root, fake=None, **kwargs):
-        return run_online.OnlineRunner(date="2026-09-22", store="店", issuer="主体",
+        kwargs.setdefault("date", "2026-09-22")
+        return run_online.OnlineRunner(store="店", issuer="主体",
                                        output_root=root / "outputs", adapter_runner=fake,
                                        **kwargs)
 
@@ -60,8 +63,11 @@ class RunOnlineTests(unittest.TestCase):
         def adapter(site, operation, input_path, output_path):
             calls.append((site, operation))
             if operation == "applications":
-                payload = {"date": "2026-09-22", "rows": [], "total": 0,
+                request = run_online.read_json(input_path)
+                payload = {"date": request["date"], "rows": [], "total": 0,
                            "api_total": 0, "observed_total": 0}
+                if "query_scope" in request:
+                    payload["query_scope"] = request["query_scope"]
                 payload.update(applications or {})
                 return {"operation": operation, "payload": payload}
             if operation == "export":
@@ -74,6 +80,293 @@ class RunOnlineTests(unittest.TestCase):
         with ZipFile(content, "w") as archive:
             archive.writestr("[Content_Types].xml", "<Types/>")
         return content.getvalue()
+
+    def prepare_missing_code_orders(self, runner):
+        run_online.atomic_json(runner.input_dir / "capture_context.json",
+                               {"agentId": "agent-1", "coid": "co-1", "uid": "u-1"})
+        path = runner.input_dir / "order_ids.json"
+        run_online.atomic_json(path, {"orders": ["O-CODE", "O-GOOD", "O-OLD"]})
+        runner.stage_start("orders_prepare")
+        runner.stage_done("orders_prepare", [path])
+
+    def missing_code_adapter(self, requests, *, code="REPAIRED", failure=None):
+        fake = FakeAdapter()
+        def item(order, goods):
+            return {"order_no": order, "sub_order_no": "S-" + order, "goods_code": goods,
+                    "title": "商品 " + order, "quantity": "1"}
+        def adapter(site, operation, input_path, output_path):
+            payload = run_online.read_json(input_path)
+            requests.append((site, operation, payload))
+            if operation == "orders":
+                return {"payload": {"batches": [{"ids": payload["orders"], "pageNum": 1,
+                    "page": {"totalNumber": 2, "totalPage": 1}, "order_ids": ["O-CODE", "O-GOOD"]}],
+                    "items": [item("O-CODE", ""), item("O-GOOD", "GOOD")]}}
+            if operation == "detail":
+                if failure:
+                    raise run_online.OnlineError("synthetic detail failure", failure, site="qianniu")
+                order = payload["order_no"]
+                return {"payload": {"order_no": order, "verified_order": True,
+                    "items": [item(order, code if order == "O-CODE" else "OLD")]}}
+            return fake(site, operation, input_path, output_path)
+        return adapter
+
+    def test_orders_missing_codes_and_absent_orders_get_one_detail_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, requests = Path(temp), []
+            adapter = self.missing_code_adapter(requests)
+            runner = self.make_runner(root, adapter)
+            self.prepare_missing_code_orders(runner)
+            runner._orders()
+            self.assertEqual({call[2]["order_no"] for call in requests if call[1] == "detail"},
+                             {"O-CODE", "O-OLD"})
+            self.assertEqual(sum(call[1] == "orders" for call in requests), 1)
+            self.assertEqual(sum(call[1] == "detail" for call in requests), 2)
+            codes = run_online.read_json(runner.input_dir / "goods_codes.json")["codes"]
+            self.assertEqual(set(codes), {"REPAIRED", "GOOD", "OLD"})
+            self.assertEqual(run_online.read_json(runner.input_dir / "order_batches.json")["missing_goods_code_orders"], [])
+            runner._jst()
+            queried = [call[2]["codes"] for call in requests if call[:2] == ("jst", "query")]
+            self.assertEqual(queried, [["GOOD", "OLD", "REPAIRED"]])
+            originals = {path: path.read_bytes() for path in runner.input_dir.glob("orders_part_*.json")}
+            resumed = self.make_runner(root, adapter, resume=runner.run_dir)
+            resumed._orders(force=True)
+            resumed._jst()
+            self.assertEqual(sum(call[1] == "orders" for call in requests), 1)
+            self.assertEqual(sum(call[1] == "detail" for call in requests), 2)
+            self.assertEqual(sum(call[1] == "query" for call in requests), 1)
+            self.assertTrue(all(path.read_bytes() == content for path, content in originals.items()))
+
+    def test_orders_unresolved_code_is_retained_without_repeating_successful_detail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, requests = Path(temp), []
+            adapter = self.missing_code_adapter(requests, code="")
+            runner = self.make_runner(root, adapter)
+            self.prepare_missing_code_orders(runner)
+            runner._orders()
+            batches = run_online.read_json(runner.input_dir / "order_batches.json")
+            self.assertEqual(batches["missing_goods_code_orders"], ["O-CODE"])
+            self.assertEqual(batches["items"][0]["goods_code"], "")
+            self.assertEqual(set(run_online.read_json(runner.input_dir / "goods_codes.json")["codes"]), {"GOOD", "OLD"})
+            resumed = self.make_runner(root, adapter, resume=runner.run_dir)
+            resumed._orders(force=True)
+            self.assertEqual(sum(call[1] == "orders" for call in requests), 1)
+            self.assertEqual(sum(call[1] == "detail" for call in requests), 2)
+
+    def test_orders_detail_global_failures_are_not_downgraded_to_missing_code(self):
+        for code in ("auth_required", "context_mismatch", "browser_disconnected", "checkpoint_invalid"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temp:
+                requests = []
+                runner = self.make_runner(Path(temp), self.missing_code_adapter(requests, failure=code))
+                self.prepare_missing_code_orders(runner)
+                with self.assertRaises(run_online.OnlineError) as error:
+                    runner._orders()
+                self.assertEqual(error.exception.code, code)
+                self.assertEqual(error.exception.site, "qianniu")
+                self.assertFalse(runner.stage_is_done("orders"))
+                self.assertFalse((runner.input_dir / "old_details.json").exists())
+
+    def test_scope_all_requests_use_batch_frozen_range_and_hash(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28), countdown='started')
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            with patch.object(invoice_scope, "datetime") as clock:
+                clock.now.side_effect = AssertionError("batch scope must not be recalculated")
+                runner = self.make_runner(Path(temp), self.export_adapter(calls, self.workbook_bytes()),
+                                          date=None, all_pending=True, query_scope=frozen)
+                runner._context()
+                runner._applications_export()
+            self.assertEqual(runner.query_scope, frozen)
+            self.assertIsNone(runner.date)
+            self.assertIn("all-pending", runner.run_dir.name)
+            self.assertEqual(runner.state["query_scope"], frozen)
+            capture = run_online.read_json(runner.input_dir / "capture_context.json")
+            self.assertEqual(capture["query_scope"], frozen)
+            self.assertIsNone(capture["date"])
+            for path in (runner.run_dir / "adapter-inputs").glob("*.json"):
+                request = run_online.read_json(path)
+                self.assertEqual(request["query_scope"], frozen)
+                self.assertIsNone(request["date"])
+            request = run_online.read_json(runner.run_dir / "adapter-inputs/applications.json")
+            receipt = run_online.read_json(runner.run_dir / "receipts/applications.json")
+            self.assertEqual(receipt["payloadSha256"], run_online.request_sha256(request))
+            changed = {**request, "query_scope": invoice_scope.make_scope(
+                all_pending=True, today=calendar_date(2026, 9, 29))}
+            self.assertNotEqual(run_online.request_sha256(request), run_online.request_sha256(changed))
+
+    def test_scope_dated_requests_preserve_legacy_shape_and_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runner = self.make_runner(Path(temp), self.export_adapter([], self.workbook_bytes()),
+                                      query_scope=invoice_scope.make_scope('2026-09-22'))
+            runner._context()
+            runner._applications_export()
+            legacy = {"date": "2026-09-22", "expected_store": "店", "expected_issuer": "主体",
+                      "rebind_if_missing": True, "agentId": "agent-1"}
+            for key in ("applications", "export"):
+                request = run_online.read_json(runner.run_dir / "adapter-inputs" / f"{key}.json")
+                receipt = run_online.read_json(runner.run_dir / "receipts" / f"{key}.json")
+                self.assertEqual(request, legacy)
+                self.assertEqual(receipt["payloadSha256"], run_online.request_sha256(legacy))
+            self.assertNotIn("query_scope", runner.state)
+            self.assertNotIn("query_scope", run_online.read_json(runner.input_dir / "capture_context.json"))
+
+    def test_new_dated_run_defaults_to_countdown_and_resume_preserves_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, calls = Path(temp), []
+            runner = self.make_runner(root, self.export_adapter(calls, self.workbook_bytes()))
+            runner._context()
+            runner._applications_export()
+            expected = {'mode': 'date', 'date': '2026-09-22', 'countdown': 'started'}
+            self.assertEqual(runner.query_scope, expected)
+            for name in ('capture_context.json', 'applications.json'):
+                self.assertEqual(run_online.read_json(runner.input_dir / name)['query_scope'], expected)
+            for key in ('applications', 'export'):
+                request = run_online.read_json(runner.run_dir / 'adapter-inputs' / f'{key}.json')
+                self.assertEqual(request['query_scope'], expected)
+                unfiltered = {key: value for key, value in request.items() if key != 'query_scope'}
+                self.assertNotEqual(run_online.request_sha256(request), run_online.request_sha256(unfiltered))
+            resumed = self.make_runner(root, self.export_adapter(calls, self.workbook_bytes()), resume=runner.run_dir)
+            self.assertEqual(resumed.query_scope, expected)
+            before = list(calls)
+            resumed._applications_export()
+            self.assertEqual(calls, before)
+
+    def test_scope_empty_all_pending_resume_keeps_window_and_does_not_recollect(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        with tempfile.TemporaryDirectory() as temp:
+            root, calls = Path(temp), []
+            adapter = self.export_adapter(calls)
+            runner = self.make_runner(root, adapter, date=None, all_pending=True, query_scope=frozen)
+            with patch.object(runner, "_run_invoice", side_effect=AssertionError("empty must not generate XLSX")):
+                self.assertEqual(runner.run()["status"], "no_applications")
+            manifest_path = runner.generated_dir / "run.json"
+            original = manifest_path.read_bytes()
+            self.assertEqual(run_online.read_json(manifest_path)["query_scope"], frozen)
+            self.assertEqual(run_online.read_json(runner.run_dir / "run.json")["query_scope"], frozen)
+            self.assertFalse(list(runner.run_dir.rglob("*.xlsx")))
+            for flags in ({}, {"all_pending": True}):
+                with self.subTest(flags=flags), patch.object(invoice_scope, "datetime") as clock:
+                    clock.now.side_effect = AssertionError("resume must preserve previous day")
+                    resumed = self.make_runner(root, adapter, date=None, resume=runner.run_dir, **flags)
+                    self.assertEqual(resumed.run()["status"], "no_applications")
+                    self.assertEqual(resumed.query_scope, frozen)
+                self.assertEqual(manifest_path.read_bytes(), original)
+            self.assertEqual(calls.count(("qianniu", "applications")), 1)
+            self.assertEqual(calls.count(("qianniu", "export")), 1)
+
+    def test_scope_raw_applications_wrong_window_or_mode_stops_before_export(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        different = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 29))
+        cases = ({"query_scope": different}, {"query_scope": None},
+                 {"date": "2026-09-22", "query_scope": frozen})
+        for invalid in cases:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temp:
+                calls = []
+                runner = self.make_runner(Path(temp), self.export_adapter(calls, applications=invalid),
+                                          date=None, all_pending=True, query_scope=frozen)
+                runner._context()
+                with self.assertRaises(run_online.OnlineError) as error:
+                    runner._applications_export()
+                self.assertEqual(error.exception.code, "checkpoint_invalid")
+                self.assertNotIn(("qianniu", "export"), calls)
+                self.assertFalse(runner.stage_is_done("applications"))
+
+    def test_scope_resume_rejects_switched_mode_or_conflicting_batch_window(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        different = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 29))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runner = self.make_runner(root, FakeAdapter(), date=None, all_pending=True, query_scope=frozen)
+            original = (runner.run_dir / "run-state.json").read_bytes()
+            for kwargs in ({"date": "2026-09-22"}, {"date": None, "all_pending": True, "query_scope": different}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(run_online.OnlineError) as error:
+                    self.make_runner(root, FakeAdapter(), resume=runner.run_dir, **kwargs)
+                self.assertEqual(error.exception.code, "resume_mismatch")
+                self.assertEqual((runner.run_dir / "run-state.json").read_bytes(), original)
+            dated = self.make_runner(root, FakeAdapter())
+            with self.assertRaises(run_online.OnlineError) as error:
+                self.make_runner(root, FakeAdapter(), date=None, all_pending=True, resume=dated.run_dir)
+            self.assertEqual(error.exception.code, "resume_mismatch")
+
+    def test_scope_replay_infers_frozen_window_and_remains_offline(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "snapshot"
+            run_online.atomic_json(source / "capture_context.json",
+                                   {"date": None, "query_scope": frozen, "store": "店", "issuer": "主体"})
+            for flags in ({}, {"all_pending": True}):
+                with self.subTest(flags=flags), patch.object(invoice_scope, "datetime") as clock:
+                    clock.now.side_effect = AssertionError("replay must preserve captured window")
+                    runner = self.make_runner(root, date=None, replay_input=source, **flags)
+                self.assertEqual(runner.query_scope, frozen)
+                self.assertTrue(runner.replay)
+                self.assertFalse(runner._needs_browser)
+                self.assertTrue(runner.run_dir.name.startswith("replay-all-pending-"))
+                with patch.object(runner, "run_script") as script:
+                    runner._run_invoice(runner.generated_dir, plan_only=True)
+                argv = script.call_args.args[0]
+                self.assertIn("--all-pending", argv)
+                self.assertIn("--replay", argv)
+                self.assertNotIn("--date", argv)
+
+    def test_scope_replay_legacy_context_inherits_application_window(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / 'snapshot'
+            run_online.atomic_json(source / 'capture_context.json', {'store': '店', 'issuer': '主体'})
+            run_online.atomic_json(source / 'applications.json', {'date': None, 'query_scope': frozen})
+            with patch.object(invoice_scope, 'datetime') as clock:
+                clock.now.side_effect = AssertionError('replay cannot recalculate today')
+                runner = self.make_runner(root, date=None, all_pending=True, replay_input=source)
+            self.assertEqual(runner.query_scope, frozen)
+            with patch.object(run_online, 'OnlineRunner') as factory:
+                self.assertEqual(run_online.main(['--replay-input', str(source), '--all-pending']), 0)
+                self.assertEqual(factory.call_args.kwargs['query_scope'], frozen)
+
+    def test_scope_generated_all_pending_outputs_are_in_checkpoint_proof(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        with tempfile.TemporaryDirectory() as temp:
+            runner = self.make_runner(Path(temp), FakeAdapter(), date=None,
+                                      all_pending=True, query_scope=frozen)
+            def generate(output, plan_only=False):
+                run_online.atomic_json(output / "run.json", {"status": "complete", "date": None,
+                    "query_scope": frozen, "ready_count": 1, "ready_amount": "1.00"})
+                (output / "exceptions.csv").write_text("synthetic", encoding="utf-8")
+                (output / "qianniu_common_all-pending.xlsx").write_bytes(b"synthetic original")
+                (output / "qianniu_invoice_tax_template_all-pending.xlsx").write_bytes(b"synthetic result")
+                return output
+            with patch.object(runner, "_context"), patch.object(runner, "_applications_export"), \
+                    patch.object(runner, "_orders"), patch.object(runner, "_jst"), \
+                    patch.object(runner, "_probe_and_details"), patch.object(runner, "_run_invoice", side_effect=generate):
+                self.assertEqual(runner.run()["status"], "complete")
+            proof = {Path(item["path"]).name for item in runner.state["stages"]["generate"]["outputs"]}
+            self.assertEqual(proof, {"run.json", "exceptions.csv", "qianniu_common_all-pending.xlsx",
+                                     "qianniu_invoice_tax_template_all-pending.xlsx"})
+
+    def test_scope_cli_missing_or_conflicting_arguments_stop_before_runner(self):
+        for argv in ([], ["--store", "店", "--issuer", "主体"],
+                     ["--all-pending", "--store", "店"], ["--all-pending", "--issuer", "主体"]):
+            with self.subTest(argv=argv), patch.object(run_online, "OnlineRunner") as runner, patch("sys.stderr"):
+                self.assertEqual(run_online.main(argv), 2)
+                runner.assert_not_called()
+        with patch.object(run_online, "OnlineRunner") as runner, patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+            run_online.main(["--all-pending", "--date", "2026-09-22"])
+        self.assertEqual(error.exception.code, 2)
+        runner.assert_not_called()
+
+    def test_scope_cli_resume_infers_all_scope_before_constructing_runner(self):
+        frozen = invoice_scope.make_scope(all_pending=True, today=calendar_date(2026, 9, 28))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_online.atomic_json(root / "run-state.json", {"date": None, "query_scope": frozen,
+                "store": "店", "issuer": "主体", "agent_id": "agent-1"})
+            with patch.object(run_online, "OnlineRunner") as runner, patch("sys.stdout"):
+                runner.return_value.run.return_value = {"status": "no_applications"}
+                self.assertEqual(run_online.main(["--resume", str(root)]), 0)
+            self.assertEqual(runner.call_args.kwargs["query_scope"], frozen)
+            self.assertTrue(runner.call_args.kwargs["all_pending"])
+            self.assertIsNone(runner.call_args.kwargs["date"])
 
     def test_zero_applications_and_empty_export_complete_without_business_workbooks(self):
         with tempfile.TemporaryDirectory() as temp:

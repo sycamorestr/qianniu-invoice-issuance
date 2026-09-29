@@ -28,6 +28,7 @@ from playwright_controller import (
 
 
 GOODS_FRAME_URL = "https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index"
+ORDER_NAVIGATION_DELAY_SECONDS = 3.0
 
 
 class PlaywrightAdapterError(RuntimeError):
@@ -48,6 +49,7 @@ def _controller_error_code(error: BrowserControllerError) -> str:
         return error.code
     codes = {
         "login_required": "auth_required",
+        "rate_limited": "rate_limited",
         "permission_required": "permission_required",
         "context_changed_store": "context_changed",
         "context_changed_account": "context_changed",
@@ -71,28 +73,13 @@ class PlaywrightAdapterRunner:
 
     accepts_binary = True
 
-    _DETAIL_READY_EXPRESSION = """
-orderNo => {
-  const expected = String(orderNo || '');
-  let current = null;
-  try {
-    current = new URL(location.href).searchParams.get('bizOrderId');
-  } catch (_) {
-    return false;
-  }
-  if (!expected || current !== expected) return false;
-  const bodyText = document.body?.innerText || '';
-  if (!bodyText.includes(expected)) return false;
-  return Array.from(document.querySelectorAll('tr')).some(row => {
-    const rowText = row.innerText || '';
-    if (!rowText.includes('商家编码')) return false;
-    const firstCell = row.querySelector('td')?.innerText || '';
-    const match = /商家编码[:：]\\s*([^\\n\\r]+)/.exec(firstCell);
-    if (!match || !match[1].trim()) return false;
-    return Object.getOwnPropertyNames(row).some(name => name.startsWith('__reactFiber$'));
-  });
-}
-"""
+    @staticmethod
+    def _detail_ready_expression(source: Path) -> str:
+        # Readiness and collection must accept exactly the same complete
+        # runtime/DOM evidence, including a proven absence of a merchant code.
+        collector = source.read_text(encoding="utf-8").strip().rstrip(";")
+        collector = collector.replace("__INPUT__", "{order_no: orderNo}")
+        return "orderNo => { try { return (" + collector + ").verified_order === true; } catch (_) { return false; } }"
 
     def __init__(self, config_path: Path, *, jst_config_path: Path | None = None,
                  profile_directory: str | None = None,
@@ -248,14 +235,16 @@ orderNo => {
             raise PlaywrightAdapterError(str(error), _controller_error_code(error), site=site) from error
         raise PlaywrightAdapterError(str(error), "browser_launch_failed", site=site) from error
 
-    def _call(self, coroutine: Any, *, site: str | None = None) -> Any:
+    def _call(self, coroutine: Any, *, site: str | None = None,
+              timeout_seconds: float | None = None) -> Any:
         if self._closed or self.loop is None:
             if hasattr(coroutine, "close"):
                 coroutine.close()
             raise PlaywrightAdapterError("Playwright controller 已关闭", "browser_disconnected", site=site)
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
         try:
-            return future.result(timeout=max(30, self.timeout_ms / 1000 + 30))
+            return future.result(timeout=max(30, self.timeout_ms / 1000 + 30,
+                                             timeout_seconds or 0))
         except FutureTimeoutError as exc:
             # A timed-out detail read must not keep running against the shared
             # orders page while the coordinator advances to another stage.
@@ -416,22 +405,24 @@ orderNo => {
                     raise PlaywrightAdapterError("detail 缺少 order_no", "configuration")
                 page = controller.page("orders")
                 target = f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_no}"
-                try:
-                    await page.goto(target, wait_until="domcontentloaded", timeout=self.timeout_ms)
-                    # The detail shell mounts asynchronously after the route
-                    # resolves.  The collector also requires a mounted React
-                    # row with a non-empty 商家编码, so wait for that exact
-                    # readiness contract before evaluating it.
-                    await page.wait_for_function(
-                        self._DETAIL_READY_EXPRESSION,
-                        arg=order_no,
-                        timeout=min(self.timeout_ms, 10_000),
-                    )
-                    return await controller.evaluate_file(role, self.skill_dir / "read_order_detail.js", payload)
-                finally:
-                    restore = self.config["browser_sessions"]["orders"]
-                    restore_url = restore.get("url") if isinstance(restore, dict) else restore
-                    await page.goto(str(restore_url), wait_until="domcontentloaded", timeout=self.timeout_ms)
+                await asyncio.sleep(ORDER_NAVIGATION_DELAY_SECONDS)
+                await page.goto(target, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                # Wait for the complete verified runtime/DOM row set;
+                # a missing merchant code is evidence, not a load spinner.
+                await page.wait_for_function(
+                    self._detail_ready_expression(self.skill_dir / "read_order_detail.js"),
+                    arg=order_no,
+                    timeout=min(self.timeout_ms, 10_000),
+                )
+                value = await controller.evaluate_file(role, self.skill_dir / "read_order_detail.js", payload)
+                # Restore only after successful collection. On a failed read
+                # leave the page intact for inspection/manual verification;
+                # a finally navigation would issue more business requests.
+                restore = self.config["browser_sessions"]["orders"]
+                restore_url = restore.get("url") if isinstance(restore, dict) else restore
+                await asyncio.sleep(ORDER_NAVIGATION_DELAY_SECONDS)
+                await page.goto(str(restore_url), wait_until="domcontentloaded", timeout=self.timeout_ms)
+                return value
             source = self.skill_dir / "read_qianniu.js"
             value = await controller.evaluate_file(role, source, payload)
             if binary:
@@ -456,7 +447,12 @@ orderNo => {
         except (OSError, json.JSONDecodeError) as exc:
             raise PlaywrightAdapterError(f"页面采集输入无法读取: {exc}", "configuration", site=site) from exc
         self.progress(f"playwright {site}/{operation}")
-        value = self._call(self._invoke_async(site, operation, payload, binary), site=site)
+        # Allow pacing/pagination and the two detail navigations without
+        # consuming the old single-operation watchdog. Network/navigation
+        # timeouts still apply and the overall operation remains bounded.
+        budget = {"orders": 120, "detail": 90}.get(operation) if site == "qianniu" else None
+        value = self._call(self._invoke_async(site, operation, payload, binary),
+                           site=site, timeout_seconds=budget)
         if binary and isinstance(value, (bytes, bytearray)):
             value = base64.b64encode(bytes(value)).decode("ascii")
         return {"operation": operation, "payload": value, "outputPath": str(output_path),

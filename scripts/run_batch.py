@@ -8,12 +8,14 @@ import json
 import sys
 import time
 import uuid
-from datetime import date as calendar_date, datetime
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from browser_lock import FileMutex, FileMutexBusy
-from run_online import OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json, utc_now, stable_sha256
+from invoice_scope import resolve_scope, scope_fields, scope_from_record, scope_label
+from run_online import (OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json,
+                        utc_now, stable_sha256, finalize_delivery)
 from shop_registry import load_registry
 
 SUCCESS = {'complete', 'no_applications', 'all_excluded', 'all_blocked', 'plan_only'}
@@ -49,7 +51,8 @@ class BatchRunner:
     def __init__(self, *, registry: Path, date: str | None = None, output_root: Path | None = None,
                  resume: Path | None = None, shops: list[str] | None = None,
                  node: str | None = None, node_modules: str | None = None,
-                 plan_only: bool = False, connect_only: bool = False, runner_factory=OnlineRunner):
+                 plan_only: bool = False, connect_only: bool = False, all_pending: bool = False,
+                 runner_factory=OnlineRunner):
         self.registry = load_registry(registry)
         self.node, self.node_modules = node, node_modules
         self.runner_factory = runner_factory
@@ -57,12 +60,15 @@ class BatchRunner:
         if resume:
             self.run_dir = resume.resolve()
             self.state = read_json(self.run_dir / 'batch-state.json')
+            try:
+                self.query_scope = resolve_scope(date=date, all_pending=all_pending, saved=self.state)
+            except ValueError as exc:
+                raise OnlineError(f'批次查询范围与保存记录不符: {exc}', 'resume_mismatch') from exc
             version = self.state.get('version')
             current_identity = (selected_identity(self.registry, self.state.get('selected_shop_ids', []))
                                 if version == 2 else self.registry['identity_sha256'])
             if (version not in {1, 2} or
                     self.state['registry_identity_sha256'] != current_identity or
-                    (date and date != self.state['date']) or
                     (shops is not None and shops != self.state['selected_shop_ids'])):
                 raise OnlineError('批次日期、店铺或浏览器配置已变化', 'resume_mismatch')
             available = {shop['id']: shop for shop in self.registry['shops']}
@@ -90,17 +96,19 @@ class BatchRunner:
             if plan_only and not self.state['plan_only']:
                 raise OnlineError('恢复不能改变 plan-only 模式', 'resume_mismatch')
         else:
-            if not date:
-                raise OnlineError('新批次必须提供 --date', 'configuration')
-            calendar_date.fromisoformat(date)
+            try:
+                self.query_scope = resolve_scope(date=date, all_pending=all_pending)
+            except ValueError as exc:
+                raise OnlineError(f'新批次必须提供 --date 或 --all-pending: {exc}', 'configuration') from exc
             available = {shop['id']: shop for shop in self.registry['shops']}
             selected = shops if shops is not None else list(available)
             if not selected or len(set(selected)) != len(selected) or set(selected) - available.keys():
                 raise OnlineError('--shops 必须是清单中不重复的店铺 id', 'configuration')
             root = (output_root or Path(self.registry['output_root'])).resolve()
-            self.run_dir = root / f'batch-{date}-{datetime.now():%Y%m%d-%H%M%S-%f}'
+            self.run_dir = root / f'batch-{scope_label(self.query_scope)}-{datetime.now():%Y%m%d-%H%M%S-%f}'
             self.run_dir.mkdir(parents=True, exist_ok=False)
-            self.state = {'version': 2, 'date': date, 'status': 'created', 'created_at': utc_now(),
+            self.state = {'version': 2, 'date': self.query_scope.get('date'),
+                          **scope_fields(self.query_scope), 'status': 'created', 'created_at': utc_now(),
                           'registry_path': self.registry['path'],
                           'registry_identity_sha256': selected_identity(self.registry, selected),
                           'selected_shop_ids': selected, 'plan_only': plan_only,
@@ -124,6 +132,7 @@ class BatchRunner:
             amounts = [shop.get(key) for shop in completed]
             totals[key] = None if any(item is None for item in amounts) else str(sum(map(Decimal, amounts), Decimal(0)))
         summary = {'status': self.state['status'], 'date': self.state['date'],
+                   **scope_fields(self.query_scope),
                    'run_dir': str(self.run_dir), 'selected_shops': len(rows),
                    'finished_shops': len(completed), 'totals_of_finished_shops': totals, 'shops': rows}
         publish_json(self.run_dir / 'batch-summary.json', summary)
@@ -137,6 +146,10 @@ class BatchRunner:
     def proof(run_dir: Path) -> list[dict]:
         state_path = run_dir / 'run-state.json'
         state = read_json(state_path)
+        try:
+            label = scope_label(scope_from_record(state))
+        except ValueError as exc:
+            raise OnlineError(f'成功店铺查询范围无效: {exc}', 'checkpoint_invalid') from exc
         paths = {state_path, run_dir / 'run.json'}
         for item in state.get('input_hashes', []):
             paths.add(Path(item['path']))
@@ -146,7 +159,7 @@ class BatchRunner:
         generated = Path(state['generated_dir'])
         paths.update(generated / name for name in ('run.json', 'exceptions.csv'))
         manifest = read_json(generated / 'run.json')
-        common = generated / ('qianniu_common_' + state['date'] + '.xlsx')
+        common = generated / f'qianniu_common_{label}.xlsx'
         if common.is_file():
             paths.add(common)
         elif manifest.get('status') == 'no_applications' and manifest.get('empty_export'):
@@ -159,7 +172,7 @@ class BatchRunner:
         else:
             raise OnlineError('成功店铺缺少原始通用模板或已验证空导出证据', 'checkpoint_invalid')
         if manifest.get('status') == 'complete':
-            paths.add(generated / ('qianniu_invoice_tax_template_' + state['date'] + '.xlsx'))
+            paths.add(generated / f'qianniu_invoice_tax_template_{label}.xlsx')
         return [{'path': str(path), 'sha256': file_sha256(path)} for path in sorted(paths)]
 
     @staticmethod
@@ -200,7 +213,9 @@ class BatchRunner:
                                   output_root=self.run_dir / 'shops', browser_config=Path(shop['browser_config']),
                                   jst_browser_config=Path(self.registry['jst_browser_config']),
                                   node=self.node, node_modules=self.node_modules, plan_only=self.state['plan_only'],
-                                  connect_only=self.connect_only)
+                                  connect_only=self.connect_only, query_scope=dict(self.query_scope))
+                    if self.query_scope['mode'] == 'all_pending':
+                        kwargs['all_pending'] = True
                     if shop.get('login_username'):
                         kwargs['expected_account'] = shop['login_username']
                     if (child_dir / 'run-state.json').exists():
@@ -216,7 +231,7 @@ class BatchRunner:
                         raise OnlineError('单店回执终态不一致', 'checkpoint_invalid')
                     shop.update({key: result.get(key) for key in ('status', 'ready_count', 'ready_amount',
                                  'blocked_count', 'blocked_amount', 'excluded_count', 'excluded_amount')})
-                    common = generated / f"qianniu_common_{self.state['date']}.xlsx"
+                    common = generated / f'qianniu_common_{scope_label(self.query_scope)}.xlsx'
                     shop.update(common_template=str(common) if common.is_file() else None,
                                 tax_template=manifest.get('output'), exceptions=str(generated / 'exceptions.csv'),
                                 run_manifest=str(generated / 'run.json'), proof=self.proof(child_dir))
@@ -227,6 +242,7 @@ class BatchRunner:
                     code, site = getattr(exc, 'code', 'failed'), getattr(exc, 'site', None)
                     shop.update(status='failed', error_code=code, error_site=site, error=str(exc))
                     shop['recovery_action'] = (
+                        '订单查询被平台限流，整批已停止；稍后确认原浏览器无验证拦截，再恢复此批次' if site == 'qianniu' and code == 'rate_limited' else
                         '由主账号为此子账号分配发票列表查看权限后恢复此批次' if site == 'qianniu' and code == 'permission_required' else
                         '在共享票聚窗口完成人工登录后恢复此批次' if site == 'jst' and code in {'auth_required', 'login_required'} else
                         '在此店铺原浏览器窗口完成人工登录后恢复此批次' if site == 'qianniu' and code in {'auth_required', 'login_required'} else
@@ -257,22 +273,40 @@ class BatchRunner:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--registry', type=Path, required=True)
-    parser.add_argument('--date')
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument('--date')
+    scope.add_argument('--all-pending', action='store_true', help='处理截至北京时间今日近两个月的全部待处理申请')
     parser.add_argument('--shops', nargs='+')
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--output-root', type=Path)
     parser.add_argument('--node'); parser.add_argument('--node-modules')
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--notification-config', type=Path,
+                        help='企微推送私有配置；默认读取 skill 根目录的 notifications.json，缺失时兼容店铺清单旁的旧配置')
+    parser.add_argument('--no-notify', action='store_true', help='仅整理交付压缩包，不向企微发送')
     parser.add_argument('--connect-only', action='store_true',
                         help='仅连接已运行浏览器；默认按需启动本批次所需的原有环境')
     args = parser.parse_args(argv)
     try:
-        result = BatchRunner(**vars(args)).run()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result['status'] == 'complete' else 2
+        kwargs = vars(args).copy()
+        kwargs.pop('notification_config')
+        kwargs.pop('no_notify')
+        runner = BatchRunner(**kwargs)
+        result = runner.run()
     except (OnlineError, OSError, ValueError) as exc:
         print(f"{getattr(exc, 'code', 'configuration')}: {exc}", file=sys.stderr)
         return 2
+    output = dict(result)
+    exit_code = 0 if result['status'] == 'complete' else 2
+    if not runner.state['plan_only'] and result['status'] in {'complete', 'partial', 'stopped'}:
+        from invoice_delivery import resolve_notification_config
+        config_path = resolve_notification_config(
+            args.notification_config, args.registry.resolve().parent / 'notifications.json')
+        output['delivery'] = finalize_delivery(runner.run_dir, config_path, package_only=args.no_notify)
+        if output['delivery'].get('status') in {'failed', 'unknown', 'busy'} and exit_code == 0:
+            exit_code = 3
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return exit_code
 
 
 if __name__ == '__main__':

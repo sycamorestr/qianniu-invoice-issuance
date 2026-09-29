@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from zipfile import BadZipFile, ZipFile
 
+from invoice_scope import resolve_scope, scope_from_record, scope_label, scope_fields
+
 
 HERE = Path(__file__).resolve().parent
 COLLECTOR = HERE / "collection_files.py"
@@ -175,6 +177,17 @@ def read_json(path: Path) -> Any:
         raise OnlineError(f"无法读取 JSON 检查点: {path}: {exc}", "checkpoint_invalid") from exc
 
 
+def replay_scope_record(source: Path) -> dict | None:
+    """Prefer captured scope; legacy identity-only contexts may use the list."""
+    for name in ('capture_context.json', 'applications.json'):
+        path = source / name
+        if path.is_file():
+            value = read_json(path)
+            if value.get('date') or 'query_scope' in value:
+                return value
+    return None
+
+
 def replace_checkpoint(source: Path, target: Path) -> None:
     """Retry only Windows sharing failures; never repeat the business request."""
     delays = (0.05, 0.1, 0.2, 0.4)
@@ -241,6 +254,12 @@ def validate_raw_payload(site: str, operation: str, value: Any,
     if value.get("blocked") is True:
         raise OnlineError(str(value.get("reason") or "页面采集被阻断"),
                           str(value.get("reason") or "adapter_failed"), site=site)
+    if site == "qianniu" and operation == "applications":
+        try:
+            if scope_from_record(value) != scope_from_record(request):
+                raise ValueError('申请快照与请求的查询范围不一致')
+        except ValueError as exc:
+            raise OnlineError(str(exc), "checkpoint_invalid") from exc
     if site == "jst" and operation == "query":
         rows = value.get("data")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -546,7 +565,8 @@ class AdapterInvoker:
 class OnlineRunner:
     """Stateful coordinator.  All mutations are checkpointed after each stage."""
 
-    def __init__(self, *, date: str, store: str, issuer: str, output_root: Path,
+    def __init__(self, *, date: str | None = None, all_pending: bool = False,
+                 query_scope: dict | None = None, store: str, issuer: str, output_root: Path,
                  agent_id: str | None = None,
                  expected_account: str | None = None,
                  run_dir: Path | None = None, resume: Path | None = None,
@@ -560,7 +580,24 @@ class OnlineRunner:
                  adapter_runner: Callable[[str, str, Path, Path], Any] | None = None) -> None:
         if resume and replay_input:
             raise OnlineError("--resume 与 --replay-input 不能同时使用", "configuration")
-        self.date = date
+        saved_scope = None
+        if resume:
+            state_path = Path(resume) / "run-state.json"
+            if not state_path.is_file():
+                raise OnlineError(f"恢复目录缺少 run-state.json: {resume}", "checkpoint_invalid")
+            saved_scope = read_json(state_path)
+        elif replay_input:
+            saved_scope = replay_scope_record(Path(replay_input))
+        try:
+            pinned = None if query_scope is None else scope_from_record({"date": date, "query_scope": query_scope})
+            self.query_scope = resolve_scope(date, all_pending, saved=saved_scope or (
+                {"date": date, "query_scope": pinned} if pinned is not None else None))
+            if pinned is not None and pinned != self.query_scope:
+                raise ValueError('查询范围与冻结范围不一致')
+        except ValueError as exc:
+            raise OnlineError(str(exc), "resume_mismatch" if resume else "configuration") from exc
+        self.date = date = self.query_scope.get('date')
+        self.scope_label = scope_label(self.query_scope)
         self.store = store
         self.issuer = issuer
         self.agent_id = str(agent_id) if agent_id not in (None, "") else None
@@ -670,7 +707,7 @@ class OnlineRunner:
             if not source.is_dir():
                 raise OnlineError(f"重放输入目录不存在: {source}", "input_invalid")
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            self.run_dir = (Path(run_dir).resolve() if run_dir else self.output_root / f"replay-{date}-{stamp}")
+            self.run_dir = (Path(run_dir).resolve() if run_dir else self.output_root / f"replay-{self.scope_label}-{stamp}")
             self.run_dir.mkdir(parents=True, exist_ok=False)
             self.input_dir = source
             self.generated_dir = self.run_dir / "generated"
@@ -681,7 +718,7 @@ class OnlineRunner:
                 self._load_jst_browser(jst_browser_config)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             store_key = hashlib.sha256(store.encode("utf-8")).hexdigest()[:10]
-            self.run_dir = (Path(run_dir).resolve() if run_dir else self.output_root / f"online-{store_key}-{date}-{stamp}")
+            self.run_dir = (Path(run_dir).resolve() if run_dir else self.output_root / f"online-{store_key}-{self.scope_label}-{stamp}")
             self.run_dir.mkdir(parents=True, exist_ok=False)
             self.input_dir = self.run_dir
             self.generated_dir = self.run_dir / "generated"
@@ -737,7 +774,7 @@ class OnlineRunner:
             self.invoker.adapter_runner = self._browser_runner
 
     def _new_state(self, mode: str) -> dict[str, Any]:
-        return {"version": 1, "mode": mode, "date": self.date, "store": self.store,
+        return {"version": 1, "mode": mode, "date": self.date, **scope_fields(self.query_scope), "store": self.store,
                 "agent_id": self.agent_id,
                 "expected_account": self.expected_account,
                 "plan_only": self.plan_only,
@@ -859,7 +896,7 @@ class OnlineRunner:
         # the browser controller, not this saved transport hint.
         request = {"date": self.date, "expected_store": self.store,
                    "expected_issuer": self.issuer,
-                   "rebind_if_missing": True, **payload}
+                   "rebind_if_missing": True, **payload, **scope_fields(self.query_scope)}
         if site == "qianniu" and operation == "context" and self.expected_account is not None:
             # Keep all non-context request identities unchanged so successful
             # export/order checkpoints remain reusable by older jobs.
@@ -1023,7 +1060,7 @@ class OnlineRunner:
             if value.get("browser_pages"):
                 self.state.setdefault("browser_pages", {})[site] = value["browser_pages"]
         verified_at = qctx.get("checked_at") or pctx.get("checked_at") or utc_now()
-        context = {"date": self.date, "store": self.store, "issuer": self.issuer,
+        context = {"date": self.date, **scope_fields(self.query_scope), "store": self.store, "issuer": self.issuer,
                    "issuer_company": self.issuer, "issuer_label": pctx.get("issuer_label"),
                    "browser_backend": self.browser_backend,
                    "profile_id": self.browser_config.get("profile_id", self.store)
@@ -1060,8 +1097,8 @@ class OnlineRunner:
                     "expected_store": self.store, "expected_issuer": self.issuer,
                 }, path, "applications")
             data = read_json(path)
-            if data.get("date") != self.date or not isinstance(data.get("rows"), list):
-                raise OnlineError("申请列表日期或结构无效", "checkpoint_invalid")
+            if not self._matches_scope(data) or not isinstance(data.get("rows"), list):
+                raise OnlineError("申请列表查询范围或结构无效", "checkpoint_invalid")
             self.stage_done("applications", [path])
         if not self.stage_is_done("export"):
             self.stage_start("export")
@@ -1103,12 +1140,18 @@ class OnlineRunner:
                 self.invoker._commit_saved_bytes(template, path.read_bytes())
             self.stage_done("export", list(dict.fromkeys((path, template))), empty_export=False)
 
+    def _matches_scope(self, record: dict) -> bool:
+        try:
+            return scope_from_record(record) == self.query_scope
+        except ValueError:
+            return False
+
     def _applications_are_empty(self) -> bool:
         """Require complete, explicit list evidence, never just a missing row."""
         if not self.stage_is_done("applications"):
             return False
         data = read_json(self.input_dir / "applications.json")
-        return (data.get("date") == self.date and data.get("rows") == []
+        return (self._matches_scope(data) and data.get("rows") == []
                 and all(type(data.get(key)) in (int, float) and data[key] == 0
                         for key in ("total", "api_total", "observed_total")))
 
@@ -1128,7 +1171,7 @@ class OnlineRunner:
         """Publish a verifiable zero result without manufacturing a workbook."""
         self.generated_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "date": self.date, "store": self.store, "issuer": self.issuer,
+            "date": self.date, **scope_fields(self.query_scope), "store": self.store, "issuer": self.issuer,
             "started_at": self.state["started_at"], "stage": "verified",
             "status": "no_applications", "replay": self.replay,
             "selected_count": 0, "ready_count": 0, "blocked_count": 0,
@@ -1169,11 +1212,13 @@ class OnlineRunner:
                 "orders": values, "agentId": context["agentId"],
                 "expected_store": self.store, "expected_issuer": self.issuer,
             }, path, f"orders-{index:03d}")
-        # This first merge reveals any historical orders requiring detail.
+        # The merge preserves uncoded rows and identifies both absent orders
+        # and orders whose list response needs detail to supply a goods code.
         self.run_script([str(COLLECTOR), "merge-orders", "--run-dir", str(self.input_dir),
                          *sum((["--part", str(path)] for path in parts), [])], "orders merge")
         batches = read_json(self.input_dir / "order_batches.json")
-        missing = [str(value) for value in batches.get("missing", [])]
+        missing = list(dict.fromkeys(str(value) for value in
+                       [*batches.get("missing", []), *batches.get("missing_goods_code_orders", [])]))
         old_path = self.input_dir / "old_details.json"
         old = read_json(old_path) if old_path.exists() else []
         old_by_order = {str(item.get("order_no")): item for item in old}
@@ -1438,7 +1483,8 @@ class OnlineRunner:
             self.generated_dir = output_dir
             self.state["generated_dir"] = str(output_dir.resolve())
             self._write_state()
-        args = [str(RUN_INVOICE), "--date", self.date, "--store", self.store,
+        scope_args = ["--all-pending"] if self.date is None else ["--date", self.date]
+        args = [str(RUN_INVOICE), *scope_args, "--store", self.store,
                 "--issuer", self.issuer, "--input-dir", str(self.input_dir),
                 "--output-dir", str(output_dir)]
         if plan_only:
@@ -1507,8 +1553,8 @@ class OnlineRunner:
                         self._run_invoice(self.generated_dir, plan_only=self.plan_only)
                     outputs = [path for path in (
                         self.generated_dir / "run.json", self.generated_dir / "exceptions.csv",
-                        self.generated_dir / f"qianniu_common_{self.date}.xlsx",
-                        self.generated_dir / f"qianniu_invoice_tax_template_{self.date}.xlsx",
+                        self.generated_dir / f"qianniu_common_{self.scope_label}.xlsx",
+                        self.generated_dir / f"qianniu_invoice_tax_template_{self.scope_label}.xlsx",
                     ) if path.is_file()]
                     self.stage_done("generate", outputs)
                 self._validate_input_hashes(check=False)
@@ -1576,7 +1622,10 @@ class OnlineRunner:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--date", required=False)
+    scope_group = parser.add_mutually_exclusive_group()
+    scope_group.add_argument("--date")
+    scope_group.add_argument("--all-pending", action="store_true",
+                             help="处理最近两个日历月内全部待处理申请；新任务冻结日期范围")
     parser.add_argument("--store", required=False)
     parser.add_argument("--issuer", required=False)
     parser.add_argument("--agent-id", required=False,
@@ -1597,9 +1646,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--node", help="explicit Node executable for workbook rendering")
     parser.add_argument("--node-modules")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--notification-config", type=Path,
+                        help="企微推送私有配置；默认读取 skill 根目录的 notifications.json，缺失时兼容输出根目录旁的旧配置")
+    parser.add_argument("--no-notify", action="store_true",
+                        help="仅整理交付压缩包，不向企微发送")
     parser.add_argument("--connect-only", action="store_true",
                         help="仅连接已运行浏览器；默认按需启动原有独立环境并复用本机登录态")
     return parser
+
+
+def finalize_delivery(run_dir: Path, config_path: Path | None, *, package_only: bool) -> dict:
+    """Delivery is separate from browser work and hash-bound business reports."""
+    try:
+        from invoice_delivery import deliver_result
+        result = deliver_result(run_dir, config_path, package_only=package_only)
+    except Exception as exc:
+        # Exception text from network/config libraries can contain the webhook.
+        # Do not turn a finished invoice job into failed business generation.
+        result = {"status": "failed", "code": "delivery_unhandled",
+                  "reason": f"交付打包或推送异常（{type(exc).__name__}），业务结果保持不变"}
+    if result.get("status") in {"failed", "unknown", "busy"}:
+        print("notification_failed: 业务任务已结束；交付打包或企微推送失败/结果未确认。"
+              "请单独重试交付，不重新采集或生成发票。", file=sys.stderr)
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1610,24 +1679,30 @@ def main(argv: list[str] | None = None) -> int:
             pass
     args = build_parser().parse_args(argv)
     try:
+        saved_scope = None
         if args.resume:
             state = read_json(args.resume / "run-state.json")
-            date = args.date or state.get("date")
+            saved_scope = state
             store = args.store or state.get("store")
             issuer = args.issuer or state.get("issuer")
             agent_id = args.agent_id or state.get("agent_id")
         elif args.replay_input:
             context_path = args.replay_input / "capture_context.json"
             context = read_json(context_path) if context_path.exists() else {}
-            date = args.date or context.get("date")
+            saved_scope = replay_scope_record(args.replay_input)
             store = args.store or context.get("store")
             issuer = args.issuer or context.get("issuer")
             agent_id = args.agent_id or context.get("agentId")
         else:
-            date, store, issuer, agent_id = args.date, args.store, args.issuer, args.agent_id
-        if not date or not store or not issuer:
-            raise OnlineError("--date、--store、--issuer 为必填参数（--resume/--replay-input 可从快照推断）", "configuration")
-        runner = OnlineRunner(date=date, store=store, issuer=issuer, agent_id=agent_id,
+            store, issuer, agent_id = args.store, args.issuer, args.agent_id
+        try:
+            query_scope = resolve_scope(args.date, args.all_pending, saved=saved_scope)
+        except ValueError as exc:
+            raise OnlineError(str(exc), "resume_mismatch" if args.resume else "configuration") from exc
+        if not store or not issuer:
+            raise OnlineError("--store、--issuer 为必填参数（--resume/--replay-input 可从快照推断）", "configuration")
+        runner = OnlineRunner(date=query_scope.get('date'), all_pending=query_scope['mode'] == 'all_pending',
+                              query_scope=query_scope, store=store, issuer=issuer, agent_id=agent_id,
                               expected_account=args.expected_account, output_root=args.output_root,
                               run_dir=args.run_dir, resume=args.resume, replay_input=args.replay_input,
                               browser_config=args.browser_config, browser_backend=args.browser_backend,
@@ -1636,13 +1711,23 @@ def main(argv: list[str] | None = None) -> int:
                               node_modules=args.node_modules,
                               plan_only=args.plan_only, connect_only=args.connect_only)
         try:
-            runner.run()
+            result = runner.run()
         finally:
             if getattr(runner, "_browser_runner", None) is not None:
                 runner._browser_runner.close()
     except OnlineError as exc:
         print(f"{exc.code}: {exc}", file=sys.stderr)
         return 2
+    if not runner.plan_only and result.get("status") in {
+            "complete", "no_applications", "all_excluded", "all_blocked"}:
+        from invoice_delivery import resolve_notification_config
+        config_path = resolve_notification_config(
+            args.notification_config, runner.output_root.resolve().parent / "notifications.json")
+        delivery = finalize_delivery(runner.run_dir, config_path,
+                                     package_only=args.no_notify or runner.replay)
+        print(json.dumps({"delivery": delivery}, ensure_ascii=False, indent=2))
+        if delivery.get("status") in {"failed", "unknown", "busy"}:
+            return 3
     return 0
 
 

@@ -27,11 +27,71 @@ await assert.rejects(()=>runContext({expected_account:'account:operator',expecte
 await assert.rejects(()=>runContext({expected_account_nick:'other:operator'}),/context_changed_account/);
 await assert.rejects(()=>runContext({}, {isLogin:false}),/login_required/);
 assert.equal((await runContext({expected_store:'account'})).store,'account');
-async function run(input,bodies,location={hostname:'myseller.taobao.com',pathname:'/home.htm/merchant-invoice/'},fetchOverride=null){
+async function run(input,bodies,location={hostname:'myseller.taobao.com',pathname:'/home.htm/merchant-invoice/'},fetchOverride=null,clock={elapsed:0,waits:[]}){
   let at=0;
-  return await vm.runInNewContext(qianniu.replace('__INPUT__',JSON.stringify(input)),{...base,location,fetch:fetchOverride||(async()=>response(bodies[at++]))});
+  // Advance virtual time at each sleep; assert actual fetch timing without
+  // imposing production pacing delays on this offline fixture suite.
+  const setTimeout=(callback,ms)=>{clock.elapsed+=ms;clock.waits.push(ms);callback();return 0;};
+  return await vm.runInNewContext(qianniu.replace('__INPUT__',JSON.stringify(input)),{...base,setTimeout,location,fetch:fetchOverride||(async()=>response(bodies[at++]))});
 }
 const apps={operation:'applications',date:'2026-01-01',agentId:'0'};
+const allScope={mode:'all_pending',start_date:'2026-07-28',end_date:'2026-09-28'};
+const allInput={operation:'applications',date:null,query_scope:allScope,agentId:'0'};
+const allUrls=[];
+const allResult=await run(allInput,[],undefined,async url=>{
+  allUrls.push(new URL(url));return response({code:200,total:2,data:[
+    {serialNo:'JULY',tid:'OJ',applyTime:'2026-07-28',applyStatus:1},
+    {serialNo:'SEPT',tid:'OS',applyTime:'2026-09-28',applyStatus:1}]});
+});
+assert.equal(allResult.rows.length,2);assert.equal(allResult.date,null);
+assert.equal(JSON.stringify(allResult.query_scope),JSON.stringify(allScope));
+const allExport=await run({...allInput,operation:'export'},[],undefined,async url=>{
+  allUrls.push(new URL(url));return {ok:true,status:200,url,arrayBuffer:async()=>new Uint8Array([80,75,3,4]).buffer};
+});
+assert.equal(allExport.base64,'UEsDBA==');
+for(const url of allUrls){
+  assert.equal(url.searchParams.get('startTime'),'2026-07-28');
+  assert.equal(url.searchParams.get('endTime'),'2026-09-28');
+  assert.equal(url.searchParams.has('rightsRemainTime'),false);
+}
+for(const selectedScope of [{...allScope,countdown:'started'},
+  {mode:'date',date:'2026-09-25',countdown:'started'}]){
+  const filteredUrls=[];
+  const filteredInput={date:selectedScope.mode==='date'?selectedScope.date:null,query_scope:selectedScope,agentId:'0'};
+  const collected=await run({...filteredInput,operation:'applications'},[],undefined,async url=>{
+    filteredUrls.push(new URL(url));return response({code:200,total:0});
+  });
+  const exported=await run({...filteredInput,operation:'export'},[],undefined,async url=>{
+    filteredUrls.push(new URL(url));return {ok:true,status:200,url,arrayBuffer:async()=>new Uint8Array([80,75,3,4]).buffer};
+  });
+  for(const value of [collected,exported]){
+    assert.deepEqual(JSON.parse(JSON.stringify(value.query_scope)),selectedScope);
+    assert.equal(value.date,filteredInput.date);
+  }
+  for(const url of filteredUrls){
+    assert.equal(url.searchParams.get('rightsRemainTime'),'100');
+    assert.equal(url.searchParams.get('startTime'),selectedScope.start_date??selectedScope.date);
+    assert.equal(url.searchParams.get('endTime'),selectedScope.end_date??selectedScope.date);
+  }
+}
+// Invalid or unsupported countdown modes cannot fall back to an unfiltered
+// request, including empty values and a dated scope for another date.
+for(const badScope of [{...allScope,countdown:'all'}, {...allScope,countdown:null},
+  {...allScope,countdown:''}, {...allScope,countdown:100},
+  {...allScope,countdown:'started',extra:true},
+  {mode:'date',date:'2026-09-24',countdown:'started'}]){
+  let calls=0;
+  await assert.rejects(()=>run({operation:'applications',date:badScope.mode==='date'?'2026-09-25':null,
+    query_scope:badScope,agentId:'0'},[],undefined,async()=>{calls++;return response({code:200,total:0});}),/invalid_query_scope/);
+  assert.equal(calls,0);
+}
+await assert.rejects(()=>run({...allInput,date:'2026-09-28'},[]),/invalid_query_scope/);
+await assert.rejects(()=>run({...allInput,query_scope:{...allScope,start_date:'2026-06-28'}},[]),/invalid_query_scope/);
+await assert.rejects(()=>run({...allInput,query_scope:{mode:'all_pending'}},[]),/invalid_query_scope/);
+await assert.rejects(()=>run({operation:'applications',agentId:'0'},[]),/date_and_current_agentId_required/);
+await assert.rejects(()=>run({...apps,date:'2026-02-30'},[]),/date_and_current_agentId_required/);
+const leapScope={mode:'all_pending',start_date:'2024-02-29',end_date:'2024-04-30'};
+assert.equal((await run({...allInput,query_scope:leapScope},[{code:200,total:0}])).total,0);
 const emptyExport=await run({...apps,operation:'export'},[],undefined,async()=>({ok:true,status:200,url:'https://einvoice.taobao.com/export',arrayBuffer:async()=>new ArrayBuffer(0)}));
 assert.equal(emptyExport.base64,'');
 assert.equal(emptyExport.status,200);
@@ -50,6 +110,14 @@ assert.equal(filtered.list_non_pending_snapshot_rows[0].serialNo,'C');
 assert.equal(filtered.list_non_pending_snapshot_rows[0].applyStatus,6);
 const fullPage=[a,...Array.from({length:19},(_,i)=>({serialNo:'P'+i,tid:'OP'+i,applyStatus:1}))];
 await assert.rejects(()=>run(apps,[{code:200,total:21,data:fullPage},{code:200,total:21,data:[a]}]),/duplicate/);
+const overlapped=await run(allInput,[{code:200,total:21,data:fullPage},{code:200,total:21,data:[a,b,c]}]);
+assert.equal(overlapped.total,22);assert.equal(overlapped.api_total,21);
+assert.equal(overlapped.duplicate_snapshot_row_count,1);
+assert.equal(overlapped.rows.filter(x=>x.serialNo==='A').length,1);
+assert.equal(overlapped.list_non_pending_snapshot_rows.length,1);
+await assert.rejects(()=>run(apps,[{code:200,total:21,data:fullPage},
+  {code:200,total:21,data:[{...a,amount:'9.99'},b]}]),/conflicting_duplicate_application/);
+assert.equal((await run(apps,[{code:200,total:1,data:[{...a,applyGmtCreate:'2026-01-01 10:00:00'}]}])).rows[0].applyTime,'2026-01-01 10:00:00');
 await assert.rejects(()=>run(apps,[{code:200,total:21,data:fullPage},{code:200,total:22,data:[c]}]),/changed/);
 await assert.rejects(()=>run(apps,[{code:200,total:2,data:[]}]),/incomplete/);
 const input={operation:'orders',orders:['O1','O2'],query:{}};
@@ -57,6 +125,41 @@ const page=(id)=>({page:{totalNumber:2,totalPage:2},query:{},mainOrders:[{id,sub
 const orders=await run(input,[page('O1'),page('O2')],{hostname:'myseller.taobao.com',pathname:'/home.htm/trade-platform/tp/sold'});
 assert.equal(orders.items[0].title,'商品');assert.equal(orders.items.length,2);
 await assert.rejects(()=>run(input,[page('O1'),page('O1')],{hostname:'myseller.taobao.com',pathname:'/home.htm/trade-platform/tp/sold'}),/duplicate/);
+
+// The pacing contract covers real fetch attempts, not just outer batches.
+const soldLocation={hostname:'myseller.taobao.com',pathname:'/home.htm/trade-platform/tp/sold'};
+const pacingClock={elapsed:0,waits:[]},fetchTimes=[];
+const pacedFetch=async()=>{fetchTimes.push(pacingClock.elapsed);return response(page(fetchTimes.length%2?'O1':'O2'));};
+await run(input,[],soldLocation,pacedFetch,pacingClock);
+await run(input,[],soldLocation,pacedFetch,pacingClock);
+assert.deepEqual(fetchTimes,[3000,6000,9000,12000]);
+for(const failure of ['network','server']){
+  const clock={elapsed:0,waits:[]},times=[];
+  await run(input,[],soldLocation,async()=>{
+    times.push(clock.elapsed);
+    if(times.length===1){
+      if(failure==='network')throw new TypeError('temporary network failure');
+      return response({}, {status:503,ok:false});
+    }
+    return response(page(times.length===2?'O1':'O2'));
+  },clock);
+  assert.equal(times.length,3);
+  assert.equal(times[0],3000);
+  assert.ok(times[1]-times[0]>=3000);
+  assert.ok(times[2]-times[1]>=3000);
+}
+// A platform throttle ends this collection without retrying or requesting
+// the next page. Existing invoice/export operations keep their own behavior.
+for(const status of [429,403]){
+  const clock={elapsed:0,waits:[]},times=[];
+  await assert.rejects(()=>run(input,[],soldLocation,async()=>{
+    times.push(clock.elapsed);return response({}, {status,ok:false});
+  },clock),status===429?/rate_limited/:/login_required/);
+  assert.deepEqual(times,[3000]);
+}
+const invoiceClock={elapsed:0,waits:[]};
+await run(apps,[{code:200,total:0}],undefined,null,invoiceClock);
+assert.deepEqual(invoiceClock.waits,[]);
 
 // Detail rows expose the true suborder id on a React fiber
 // ancestor. It must remain a string because a 19-digit numeric id is lossy.
@@ -66,22 +169,22 @@ const detailCode='TEST-SKU-250g';
 const detailRuntime=(overrides={})=>({id:detailOrderNo,subOrders:[{
   idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle,extra:[{name:'商家编码',value:detailCode}],skuText:[]}
 }],...overrides});
-function detailRow(order){
+function detailRow(order,options={}){
   const cells=[
-    {innerText:`${detailTitle}\n商家编码:${detailCode}`},
+    {innerText:options.firstCell??`${detailTitle}\n商家编码:${detailCode}`},
     {innerText:'规格: 250g'},
     {innerText:'交易成功'},
-    {innerText:'140.00\nx1'}
+    {innerText:options.priceCell??'140.00\nx1'}
   ];
   const row={innerText:cells.map(cell=>cell.innerText).join('\n'),querySelectorAll:selector=>selector==='td'?cells:[]};
-  Object.defineProperty(row,'__reactFiber$unit',{value:{memoizedProps:{className:'order-item'},return:{memoizedProps:order,return:null}}});
+  if(!options.noFiber)Object.defineProperty(row,'__reactFiber$unit',{value:{memoizedProps:{className:'order-item'},return:{memoizedProps:order,return:null}}});
   return row;
 }
-function runDetail(order=detailRuntime()){
-  const row=detailRow(order);
+function runDetail(order=detailRuntime(),options={}){
+  const rows=options.rows??[detailRow(order,options)];
   return vm.runInNewContext(detail.replace('__INPUT__',JSON.stringify({order_no:detailOrderNo})),{
     ...base,location:{href:`https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId=${detailOrderNo}`},
-    document:{body:{innerText:`订单编号 ${detailOrderNo}`},querySelectorAll:selector=>selector==='tr'?[row]:[]}
+    document:{body:{innerText:`订单编号 ${detailOrderNo}`},querySelectorAll:selector=>selector==='tr'?rows:[]}
   });
 }
 const detailed=runDetail();
@@ -98,6 +201,42 @@ assert.throws(()=>runDetail(detailRuntime({subOrders:[
 assert.throws(()=>runDetail(detailRuntime({subOrders:[
   {idStr:9000000000000000001,quantity:'1',itemInfo:{title:detailTitle,extra:[{name:'商家编码',value:detailCode}]}}
 ]})),/runtime_sub_order_idStr_missing/);
+// The live code-less product row still has a complete React order, title,
+// positive quantity and the original DOM price cell. Its notice is not title.
+const notice='当前订单无发货时间和发货倒计时信息';
+const noCodeRuntime=detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'4800',
+  itemInfo:{title:detailTitle,extra:[{visible:'SOLID',value:notice}],skuText:[]}}]});
+const noCodeDom={firstCell:`${detailTitle}\n${notice}`,priceCell:'0.01\n\nx4800'};
+const noCodeDetail=runDetail(noCodeRuntime,noCodeDom);
+assert.equal(noCodeDetail.verified_order,true);
+assert.equal(noCodeDetail.items[0].goods_code,'');
+assert.equal(noCodeDetail.items[0].goods_code_missing,true);
+assert.equal(noCodeDetail.items[0].title,detailTitle);
+assert.equal(noCodeDetail.items[0].quantity,'4800');
+assert.equal(noCodeDetail.items[0].price_cell,'0.01\n\nx4800');
+assert.equal(noCodeDetail.items[0].unit_price,'0.01');
+const noCodePlain=detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle,extra:[]}}]});
+assert.equal(runDetail(noCodePlain,{firstCell:detailTitle}).items[0].goods_code,'');
+const explicitEmptyCode=detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',
+  itemInfo:{title:detailTitle,extra:[{name:'商家编码',value:''}]}}]});
+assert.equal(runDetail(explicitEmptyCode,{firstCell:`${detailTitle}\n商家编码:`}).items[0].goods_code,'');
+assert.throws(()=>runDetail(noCodeRuntime,{...noCodeDom,rows:[]}),/incomplete_order_detail/);
+assert.throws(()=>runDetail(noCodeRuntime,{...noCodeDom,noFiber:true}),/incomplete_order_detail/);
+assert.throws(()=>runDetail(noCodeRuntime,{...noCodeDom,priceCell:'0.01\nx0'}),/incomplete_order_detail/);
+assert.throws(()=>runDetail(noCodeRuntime,{...noCodeDom,firstCell:`${detailTitle}\n未知提示`}),/runtime_sub_order_not_unique/);
+assert.throws(()=>runDetail(noCodePlain),/runtime_sub_order_not_unique/);
+assert.throws(()=>runDetail(detailRuntime(),{firstCell:detailTitle}),/runtime_sub_order_not_unique/);
+assert.throws(()=>runDetail(detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle}}]}),
+  {firstCell:detailTitle}),/runtime_goods_code_not_loaded/);
+assert.throws(()=>runDetail(detailRuntime({subOrders:[...noCodePlain.subOrders,
+  {idStr:'9000000000000000002',quantity:'1',itemInfo:{title:'另一商品',extra:[]}}]}),
+  {firstCell:detailTitle}),/incomplete_order_detail/);
+assert.throws(()=>runDetail(noCodePlain,{rows:[detailRow(noCodePlain,{firstCell:detailTitle}),
+  detailRow(noCodePlain,{firstCell:detailTitle})]}),/duplicate_order_detail_row/);
+assert.throws(()=>runDetail(detailRuntime({subOrders:[...noCodePlain.subOrders,...noCodePlain.subOrders]}),
+  {firstCell:detailTitle}),/runtime_sub_order_idStr_duplicate/);
+assert.throws(()=>runDetail(detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle,
+  extra:[{name:'商家编码',value:detailCode},{name:'商家编码',value:'conflict'}]}}]})),/runtime_goods_code_conflict/);
 let sparseBody;
 const onePage={page:{totalNumber:1,totalPage:1},query:{},mainOrders:[{id:'O1',subOrders:[]}]};
 const sparse=await run({operation:'orders',orders:['O1'],query:{tabCode:'latest3Months'}},[onePage],
