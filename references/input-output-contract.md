@@ -124,7 +124,9 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 ## 终态、交付与测试
 
-正式 CLI 的业务终态保存并释放连接/锁后，调用独立 `invoice_delivery.py` 生成 ZIP，并默认读取技能根目录的私有 `notifications.json` 推送企微；显式配置优先，旧工作目录仅在技能内未配置时兼容。打包与推送回执只写 `delivery/`，不改以下业务终态或成功文件哈希。多店在批次层调用一次；单店 CLI 在单店层调用，`OnlineRunner` 子流程不自行发消息。`--no-notify` 和离线重放只打包，`--plan-only` 不触发。发送失败单独补发，无需恢复业务采集。详见[打包与企微推送](notifications.md)。
+正式 CLI 的业务终态保存并释放连接/锁后，调用独立 `invoice_delivery.py` 生成 ZIP，并默认读取技能根目录的私有 `notifications.json`；显式配置优先，旧工作目录仅在技能内未配置时兼容。压缩包命名为 `千牛平台_<店铺或N店铺>_开票汇总_<日期或范围>_<内容哈希前12位>.zip`。打包与推送回执只写 `delivery/`，不改以下业务终态或成功文件哈希；仅更名不改变 ZIP 内容哈希，已成功的相同内容和目标继续复用回执。
+
+企微仅发送最终汇总文件消息。多店只有批次 `complete` 且全部选中店铺均为成功终态、交付文件校验通过后，才上传并发送一个包；`partial`、`stopped`、`interrupted` 等未完成状态只在本地打包，恢复完成后再发。`OnlineRunner` 子流程不自行发消息；批次子店通过单店 CLI 或独立补发 CLI 执行时同样禁止外发。独立单店任务在成功终态发送本店最终包。`--no-notify` 和离线重放只打包，`--plan-only` 不触发。发送失败只补发最终汇总，无需恢复业务采集。详见[打包与企微推送](notifications.md)。
 
 | 状态 | 含义 |
 | --- | --- |

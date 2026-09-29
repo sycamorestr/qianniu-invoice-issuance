@@ -6,6 +6,7 @@ opens a browser or changes business output, and never logs webhook URLs.
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -22,12 +23,28 @@ import zipfile
 
 from browser_lock import FileMutex, FileMutexBusy
 from invoice_scope import scope_from_record, scope_label
+from invoice_delivery_log import render_summary_log
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 45
 SUCCESS = {'complete', 'no_applications', 'all_excluded', 'all_blocked', 'plan_only'}
 COUNTS = ('selected_count', 'ready_count', 'blocked_count', 'excluded_count')
 AMOUNTS = ('ready_amount', 'blocked_amount', 'excluded_amount')
+SUMMARY_LOG_NAME = '千牛平台_开票汇总日志.txt'
+FAILURE_REASONS = {
+    'login_required': '登录已失效，需要在原浏览器中完成登录后恢复',
+    'auth_required': '登录认证未通过，需要在原浏览器中处理后恢复',
+    'permission_required': '当前账号缺少发票查看权限，需要主账号授权后恢复',
+    'context_missing': '业务页面必要信息未就绪，需要恢复原页面后继续',
+    'context_changed': '页面店铺或开票主体发生变化，需要核对原环境',
+    'context_mismatch': '当前店铺或开票主体与任务不一致，需要核对原环境',
+    'profile_locked': '浏览器环境正被其他任务占用，待释放后恢复',
+    'page_missing': '业务页面缺失，需要恢复原页面后继续',
+    'browser_disconnected': '浏览器连接中断，需要恢复原环境后继续',
+    'rate_limited': '平台限制了请求频率，需处理验证或稍后恢复',
+    'checkpoint_invalid': '恢复记录或交付证据不完整，需要检查本地作业记录',
+    'resume_mismatch': '原任务的环境或文件校验不一致，已停止恢复',
+}
 
 
 class DeliveryError(Exception):
@@ -122,6 +139,34 @@ def _summary(manifest):
     return result
 
 
+def _exception_reasons(content, summary):
+    """Aggregate only the already verified business CSV, never raw errors."""
+    reader = csv.DictReader(io.StringIO(content.decode('utf-8-sig'), newline=''), strict=True)
+    _require({'申请流水号', '金额', '暂缓原因'} <= set(reader.fieldnames or []),
+             message='异常清单缺少汇总日志所需字段，未发送')
+    groups, seen = {}, set()
+    for row in reader:
+        sid = (row.get('申请流水号') or '').strip()
+        reason = ' '.join((row.get('暂缓原因') or '').split())
+        _require(sid and sid not in seen and reason and None not in row,
+                 message='异常清单行不完整或流水号重复，未发送')
+        seen.add(sid)
+        raw = (row.get('金额') or '').strip()
+        try:
+            amount = Decimal(raw) if raw else None
+        except InvalidOperation:
+            raise DeliveryError('verification_failed', '异常清单金额无效，未发送') from None
+        _require(amount is None or amount.is_finite(), message='异常清单金额无效，未发送')
+        group = groups.setdefault(reason, {'reason': reason, 'count': 0, 'amount': Decimal(0)})
+        group['count'] += 1
+        group['amount'] = None if amount is None or group['amount'] is None else group['amount'] + amount
+    counts = [summary[key] for key in ('blocked_count', 'excluded_count')]
+    if all(value is not None for value in counts):
+        _require(len(seen) == sum(counts), message='异常清单笔数与结果汇总不一致，未发送')
+    return [{**group, 'amount': str(group['amount']) if group['amount'] is not None else None}
+            for group in groups.values()]
+
+
 def _shop_files(run_dir, scope, batch_shop=None):
     state_path = _inside(run_dir / 'run-state.json', run_dir)
     state_data = state_path.read_bytes()
@@ -169,7 +214,9 @@ def _shop_files(run_dir, scope, batch_shop=None):
         content = _verified_bytes(path, proof)
         _require(outer_proof.get(path) == _sha(content))
         files[name] = content
-    return files, _summary(manifest)
+    summary = _summary(manifest)
+    summary['exception_reasons'] = _exception_reasons(files['exceptions.csv'], summary)
+    return files, summary
 
 
 def _package_content(run_dir):
@@ -203,6 +250,10 @@ def _package_content(run_dir):
             else:
                 # Failure strings often contain local paths or request URLs.
                 row['status'] = 'failed' if row['status'] == 'failed' else 'not_executed'
+                if row['status'] == 'failed':
+                    site = {'qianniu': '千牛：', 'jst': '票聚：'}.get(shop.get('error_site'), '')
+                    row['failure_reason'] = site + FAILURE_REASONS.get(
+                        shop.get('error_code'), '任务执行失败，需检查本地作业记录后恢复')
             report['shops'].append(row)
     else:
         state = _read_json(run_dir / 'run-state.json')
@@ -213,6 +264,7 @@ def _package_content(run_dir):
         plan_only = summary['status'] == 'plan_only'
     report['note'] = '仅生成模板，未提交开票。通用模板保留平台完整原件；税局模板仅含通过校验的申请。'
     entries['result.json'] = _json_bytes(report)
+    entries[SUMMARY_LOG_NAME] = render_summary_log(report)
     return entries, report, plan_only
 
 
@@ -315,12 +367,27 @@ def deliver_result(run_dir: Path, config_path: Path | None = None, *, package_on
         period = scope['date'] if scope['mode'] == 'date' else f'{scope["start_date"]}_{scope["end_date"]}'
         stores = report.get('shops', [report])
         name = _safe_name(stores[0]['store']) if len(stores) == 1 else f'{len(stores)}店铺'
-        zip_path = _inside(delivery_dir / f'{name}_开票资料_{period}_{digest[:12]}.zip', delivery_dir)
+        zip_path = _inside(delivery_dir / f'千牛平台_{name}_开票汇总_{period}_{digest[:12]}.zip', delivery_dir)
         _publish(zip_path, content)
         _publish(_inside(delivery_dir / 'result.json', delivery_dir), _json_bytes(report))
+        _publish(_inside(delivery_dir / SUMMARY_LOG_NAME, delivery_dir), entries[SUMMARY_LOG_NAME])
         result.update(zip_path=str(zip_path), zip_sha256=digest, zip_bytes=len(content))
         if package_only or plan_only:
             result['status'] = 'plan_only' if plan_only else 'packaged'
+            return result
+        # Only the completed batch may send. Enforce this here as well as in
+        # the batch CLI so standalone delivery/retry cannot send an interim
+        # package or one of the batch's child shops.
+        if report['type'] == 'batch' and (
+                report['status'] != 'complete'
+                or any(shop['status'] not in SUCCESS for shop in report['shops'])):
+            result.update(status='deferred', code='batch_incomplete',
+                          reason='批次尚未全部完成，压缩包仅保存在本地；恢复完成后统一发送最终汇总')
+            return result
+        if report['type'] == 'single' and run_dir.parent.name == 'shops' and (
+                run_dir.parent.parent / 'batch-state.json').exists():
+            result.update(status='deferred', code='batch_child',
+                          reason='批次内店铺不单独推送，请使用整批最终汇总')
             return result
         url, inactive = _destination(Path(config_path) if config_path is not None else None)
         if inactive:

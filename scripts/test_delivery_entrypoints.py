@@ -189,7 +189,7 @@ class DeliveryEntrypointTests(unittest.TestCase):
         self.assertEqual(summary['status'], 'complete')
         self.assertNotIn('delivery', summary)
 
-    def test_batch_partial_and_stopped_deliver_but_plan_only_does_not(self):
+    def test_batch_partial_and_stopped_only_package_but_plan_only_does_not(self):
         registry = self.registry()
         for status, plan_only in (('partial', False), ('stopped', False), ('complete', True)):
             runner = SimpleNamespace(run_dir=self.output / 'batch', state={'plan_only': plan_only},
@@ -202,7 +202,7 @@ class DeliveryEntrypointTests(unittest.TestCase):
                 if plan_only:
                     send.assert_not_called()
                 else:
-                    send.assert_called_once_with(runner.run_dir, self.config, package_only=False)
+                    send.assert_called_once_with(runner.run_dir, self.config, package_only=True)
 
     def test_batch_explicit_config_and_no_notify(self):
         registry = self.registry()

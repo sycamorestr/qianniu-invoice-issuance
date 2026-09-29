@@ -302,7 +302,9 @@ def main(argv=None):
         from invoice_delivery import resolve_notification_config
         config_path = resolve_notification_config(
             args.notification_config, args.registry.resolve().parent / 'notifications.json')
-        output['delivery'] = finalize_delivery(runner.run_dir, config_path, package_only=args.no_notify)
+        output['delivery'] = finalize_delivery(
+            runner.run_dir, config_path,
+            package_only=args.no_notify or result['status'] != 'complete')
         if output['delivery'].get('status') in {'failed', 'unknown', 'busy'} and exit_code == 0:
             exit_code = 3
     print(json.dumps(output, ensure_ascii=False, indent=2))
