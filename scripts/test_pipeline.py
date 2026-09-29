@@ -424,7 +424,8 @@ def test_final_xlsx_preserves_zero_tax_as_required_template_text():
         expected[name]=[
             {'发票流水号':'00012345678901234567','税率':'0'},
             {'发票流水号':'00012345678901234568','税率':'0.13'},
-            {'发票流水号':'00012345678901234569','税率':''},
+            {'发票流水号':'00012345678901234569','税率':'0.1'},
+            {'发票流水号':'00012345678901234570','税率':''},
         ]
         with ZipFile(template) as original,ZipFile(authored,'w',ZIP_DEFLATED) as written:
             for entry in original.infolist():
@@ -447,11 +448,11 @@ def test_final_xlsx_preserves_zero_tax_as_required_template_text():
         with ZipFile(output) as z:
             xml=ET.fromstring(z.read(meta['path']))
             cells={cell.get('r'):cell for cell in xml.iter(Q('c'))}
-            for offset,value in enumerate(['0','0.13'],1):
+            for offset,value in enumerate(['0','0.13','0.1'],1):
                 cell=cells[rate_col+str(meta['header_row']+offset)]
                 assert cell.get('t')=='inlineStr'
                 assert cell.find(Q('is')).find(Q('t')).text==value
-            assert rate_col+str(meta['header_row']+3) not in cells
+            assert rate_col+str(meta['header_row']+4) not in cells
 
 
 def test_regular_discount_remains_discount_and_cannot_claim_red_reversal():

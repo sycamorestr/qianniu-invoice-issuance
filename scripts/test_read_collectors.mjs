@@ -226,8 +226,27 @@ assert.throws(()=>runDetail(noCodeRuntime,{...noCodeDom,priceCell:'0.01\nx0'}),/
 assert.throws(()=>runDetail(noCodeRuntime,{...noCodeDom,firstCell:`${detailTitle}\n未知提示`}),/runtime_sub_order_not_unique/);
 assert.throws(()=>runDetail(noCodePlain),/runtime_sub_order_not_unique/);
 assert.throws(()=>runDetail(detailRuntime(),{firstCell:detailTitle}),/runtime_sub_order_not_unique/);
-assert.throws(()=>runDetail(detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle}}]}),
-  {firstCell:detailTitle}),/runtime_goods_code_not_loaded/);
+// Live responses may omit optional extra entirely. This is only accepted
+// when every rendered product has a unique complete runtime counterpart.
+const omittedExtra=detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle}}]});
+const omittedDetail=runDetail(omittedExtra,{firstCell:detailTitle});
+assert.equal(omittedDetail.items[0].goods_code_missing,true);
+assert.equal(omittedDetail.items[0].goods_code,'');
+assert.equal(omittedDetail.items[0].sub_order_no,detailOrderNo);
+assert.throws(()=>runDetail(omittedExtra),/runtime_sub_order_not_unique/);
+assert.throws(()=>runDetail(omittedExtra,{firstCell:`${detailTitle}\n未知提示`}),/runtime_sub_order_not_unique/);
+for(const extra of [null,{},'unloaded',undefined]){
+  assert.throws(()=>runDetail(detailRuntime({subOrders:[{idStr:detailOrderNo,quantity:'1',itemInfo:{title:detailTitle,extra}}]}),
+    {firstCell:detailTitle}),/runtime_goods_code_not_loaded/);
+}
+const omittedMulti=detailRuntime({subOrders:[...omittedExtra.subOrders,
+  {idStr:'9000000000000000002',quantity:'2',itemInfo:{title:'另一商品'}}]});
+const omittedRows=[detailRow(omittedMulti,{firstCell:detailTitle}),
+  detailRow(omittedMulti,{firstCell:'另一商品',priceCell:'10.00 x2'})];
+assert.equal(runDetail(omittedMulti,{rows:omittedRows}).items.length,2);
+assert.throws(()=>runDetail(omittedMulti,{rows:omittedRows.slice(0,1)}),/incomplete_order_detail/);
+assert.throws(()=>runDetail(detailRuntime({subOrders:[...omittedExtra.subOrders,
+  {...omittedExtra.subOrders[0],idStr:'9000000000000000002'}]}),{firstCell:detailTitle}),/runtime_sub_order_not_unique/);
 assert.throws(()=>runDetail(detailRuntime({subOrders:[...noCodePlain.subOrders,
   {idStr:'9000000000000000002',quantity:'1',itemInfo:{title:'另一商品',extra:[]}}]}),
   {firstCell:detailTitle}),/incomplete_order_detail/);

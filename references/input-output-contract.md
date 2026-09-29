@@ -19,6 +19,8 @@ shop_registry.py：读取原清单及工作台新增登记，校验隔离与环�
 
 ## 参数和运行环境
 
+`--tax-rate-config <文件>` 为单店、多店和本地生成入口选择税率配置，默认读取技能根目录 `tax-rates.json`。新任务保存解析后的 `tax_rate_policy`；批次对所有选中店铺一次冻结。单店 `tax-rate-policy.json` 为生成与补证阶段传递相同规则，原始票聚快照不变。恢复沿用保存规则，旧作业缺字段按票聚；显式指定不同规则拒绝恢复。配置详见[税率配置](tax-rates.md)。
+
 新任务必须提供查询范围、店铺、票聚主体和浏览器配置。范围显式二选一：`--date YYYY-MM-DD` 或 `--all-pending`，不能同时提供，也不能都省略后默认为全量。配置也可通过 `QIANNIU_BROWSER_CONFIG` 指定。`--run-dir` 可指定尚不存在的新作业目录，默认目录由店铺标识、范围标签和微秒时间组成。
 
 `--all-pending` 按约定查询最近两个日历月：以创建时的北京时间今日为结束日期，向前两个日历月为开始日期，包含首尾两天。例如 2026-09-28 创建的任务固定为 2026-07-28 至 2026-09-28。新任务默认只处理开票倒计时已开始的申请，保存 `date=null` 及 `query_scope={"mode":"all_pending","start_date":"2026-07-28","end_date":"2026-09-28","countdown":"started"}`；文件及目录范围标签使用 `all-pending`。新单日任务保存 `date` 及 `query_scope={"mode":"date","date":"YYYY-MM-DD","countdown":"started"}`。倒计时筛选在创建时冻结，旧任务缺字段则恢复原无筛选范围，不静默改变旧检查点或输出。
@@ -120,7 +122,7 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 本技能不提交实际开票，也没有跨任务已开票登记。新建最近两个月批次会重新导出当时仍待处理的申请，可能与旧交付重叠；不能将不同批次文件解释为已自动去重。恢复原批次只继续其固定范围与原件快照，不把新增申请混入成功检查点。
 
-`verify_sources()` 独立复核源字段、关联和金额。Artifact Tool 按表头批量写入作者副本，再由 `template_io.py` 以原始模板为基底替换数据区；`verify_workbook()` 逐单元格核验数据及模板其他部件。通过后才发布正式文件。原模板要求全部数据文本输入，明确零税率为文本 `0`。
+`verify_sources()` 独立复核源字段、关联和金额，并按 `run.tax_rate_policy` 核对票聚或配置税率；`fixed` 还核对税率来源为 `store_fixed`。Artifact Tool 按表头批量写入作者副本，再由 `template_io.py` 以原始模板为基底替换数据区；`verify_workbook()` 逐单元格核验数据及模板其他部件。通过后才发布正式文件。原模板要求全部数据文本输入，明确零税率为文本 `0`。
 
 ## 终态、交付与测试
 

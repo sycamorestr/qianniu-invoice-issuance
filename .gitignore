@@ -16,6 +16,9 @@ shops.*.json
 notifications.json
 notifications.*.json
 !assets/notifications.example.json
+tax-rates.json
+tax-rates.*.json
+!assets/tax-rates.example.json
 shop-input.json
 data/
 downloads/

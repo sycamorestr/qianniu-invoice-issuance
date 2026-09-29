@@ -17,6 +17,8 @@ from typing import Any, Iterable
 from uuid import uuid4
 from html import unescape
 
+from invoice_tax_policy import normalize_policy
+
 
 MONEY = Decimal("0.01")
 ZERO = Decimal("0")
@@ -398,7 +400,10 @@ def details_for(
     order_goods: dict[str, set[str]],
     jst_index: dict[str, list[dict[str, Any]]],
     order_items: dict[str, list[dict[str, Any]]] | None = None,
+    tax_rate_policy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    policy = normalize_policy(tax_rate_policy)
+    fixed_rate = policy["source"] == "fixed"
     details: list[dict[str, Any]] = []
     extra_fees: list[tuple[int, dict[str, Any], Decimal]] = []
     previous_positive: dict[str, Any] | None = None
@@ -442,7 +447,7 @@ def details_for(
             if negative_order_no and negative_order_no != previous_positive["order_no"]:
                 build.error(f"源行 {source_row} 的折扣订单编号与其前商品不一致")
             negative_rate = value(row, "tax_rate")
-            if clean_text(negative_rate) is not None:
+            if not fixed_rate and clean_text(negative_rate) is not None:
                 row_errors: list[str] = []
                 normalized = normalize_tax_text(negative_rate, row_errors, f"源行 {source_row} 税率")
                 if row_errors:
@@ -463,7 +468,10 @@ def details_for(
         tax_rate = None
         tax_rate_effective = None
         tax_rate_source = None
-        if mapping:
+        if fixed_rate:
+            tax_rate = tax_rate_effective = policy["rate"]
+            tax_rate_source = "store_fixed"
+        elif mapping:
             jst_tax_rate_raw = value(mapping, "tax_rate")
             virtual_category_raw = value(mapping, "virtual_category")
             raw_rate = jst_tax_rate_raw if clean_text(jst_tax_rate_raw) is not None else virtual_category_raw
@@ -536,7 +544,7 @@ def details_for(
             if explicit and explicit != recipient[field_name]:
                 fee_errors.append(f"源行 {source_row} 价外费用的{label}与归属商品不一致")
         fee_rate = value(row, "tax_rate")
-        if clean_text(fee_rate) is not None:
+        if not fixed_rate and clean_text(fee_rate) is not None:
             normalized = normalize_tax_text(fee_rate, fee_errors, f"源行 {source_row} 价外费用税率")
             if normalized is not None and normalized != recipient["tax_rate_effective"]:
                 fee_errors.append(f"源行 {source_row} 价外费用税率与归属商品税率不一致")
@@ -587,6 +595,7 @@ def build_invoice(
     run: dict[str, Any],
     order_items: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
+    policy = normalize_policy(run.get("tax_rate_policy"))
     expected = expected_total(build)
     # Negative applications are deliberately excluded before any invoice fields
     # or order/JST detail mapping are required. Ordinary discounts still apply
@@ -598,7 +607,7 @@ def build_invoice(
         computed = None
     else:
         basic = base_fields(build)
-        details = details_for(build, order_goods, jst_index, order_items)
+        details = details_for(build, order_goods, jst_index, order_items, policy)
         computed = sum((Decimal(line["amount"]) + Decimal(line["discount_amount"]) for line in details), ZERO)
         if expected is not None and not money_equal(expected, computed):
             build.error(
@@ -672,7 +681,12 @@ def main() -> int:
     if mode != "preview":
         print("run.mode 只能是 preview；本技能仅生成模板", file=sys.stderr)
         return 2
-    run = {**run, "mode": mode}
+    try:
+        policy = normalize_policy(run.get("tax_rate_policy"))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run = {**run, "mode": mode, "tax_rate_policy": policy}
     raw_selected = source.get("selected_application_ids", [])
     if not isinstance(raw_selected, list):
         print("selected_application_ids 必须是数组", file=sys.stderr)
@@ -747,6 +761,7 @@ def main() -> int:
         "run_id": clean_text(run.get("run_id")) or str(uuid4()),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
+        "tax_rate_policy": policy,
         "selected_application_ids": selected,
         "ignored_application_ids": sorted(all_application_ids - selected_set),
         "blocked": blocked,

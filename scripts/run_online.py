@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterable
 from zipfile import BadZipFile, ZipFile
 
 from invoice_scope import resolve_scope, scope_from_record, scope_label, scope_fields
+from invoice_tax_policy import normalize_policy, resolve_tax_rate_policy
 
 
 HERE = Path(__file__).resolve().parent
@@ -48,6 +49,31 @@ class OnlineError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.site = site if site in {"qianniu", "jst"} else None
+
+
+def frozen_tax_rate_policy(store: str, config_path: Path | None = None,
+                           supplied_policy: dict | None = None,
+                           saved: dict | None = None) -> dict:
+    """Resolve once before collection; resume never consults new defaults."""
+    try:
+        requested = normalize_policy(supplied_policy) if supplied_policy is not None else None
+        if config_path is not None or (saved is None and requested is None):
+            configured = resolve_tax_rate_policy(store, config_path)
+            if requested is not None and configured != requested:
+                raise OnlineError("指定税率配置与传入的冻结策略不一致",
+                                  "resume_mismatch" if saved is not None else "configuration")
+            requested = configured
+    except (ValueError, OSError, TypeError) as exc:
+        raise OnlineError(f"税率配置无效: {exc}", "configuration") from exc
+    if saved is None:
+        return requested
+    try:
+        previous = normalize_policy(saved.get("tax_rate_policy"))
+    except (ValueError, TypeError) as exc:
+        raise OnlineError(f"保存的税率策略无效: {exc}", "checkpoint_invalid") from exc
+    if requested is not None and requested != previous:
+        raise OnlineError("恢复时税率策略与原任务不一致；请新建任务应用新配置", "resume_mismatch")
+    return previous
 
 
 def load_browser_config(config_path: Path | None = None) -> tuple[dict[str, Any], Path | None]:
@@ -573,6 +599,8 @@ class OnlineRunner:
                  replay_input: Path | None = None,
                  browser_config: Path | None = None,
                  jst_browser_config: Path | None = None,
+                 tax_rate_config: Path | None = None,
+                 tax_rate_policy: dict | None = None,
                  browser_backend: str | None = None,
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False,
@@ -599,6 +627,8 @@ class OnlineRunner:
         self.date = date = self.query_scope.get('date')
         self.scope_label = scope_label(self.query_scope)
         self.store = store
+        self.tax_rate_policy = frozen_tax_rate_policy(
+            store, tax_rate_config, tax_rate_policy, saved_scope if resume else None)
         self.issuer = issuer
         self.agent_id = str(agent_id) if agent_id not in (None, "") else None
         if expected_account is not None and not isinstance(expected_account, str):
@@ -724,6 +754,7 @@ class OnlineRunner:
             self.generated_dir = self.run_dir / "generated"
             self.state = self._new_state("online")
         self.generated_dir.parent.mkdir(parents=True, exist_ok=True)
+        self._bind_tax_rate_policy()
         if self.browser_config:
             self.state["browser_config"] = self.browser_config
         if self.browser_config_path:
@@ -755,6 +786,24 @@ class OnlineRunner:
         self.jst_browser_config_path = selected_path
         self.jst_browser_identity = identity
 
+    def _bind_tax_rate_policy(self) -> None:
+        """Keep policy provenance separate from immutable browser evidence."""
+        path = self.run_dir / "tax-rate-policy.json"
+        saved = self.state.get("tax_rate_policy_file")
+        if saved is not None:
+            if (not isinstance(saved, dict) or saved.get("path") != str(path.resolve())
+                    or not path.is_file() or file_sha256(path) != saved.get("sha256")):
+                raise OnlineError("冻结税率策略文件缺失或发生变化", "resume_mismatch")
+        content = (json.dumps(self.tax_rate_policy, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if path.exists():
+            if path.read_bytes() != content:
+                raise OnlineError("冻结税率策略文件与保存策略不一致", "resume_mismatch")
+        else:
+            atomic_bytes(path, content)
+        self.tax_rate_policy_path = path
+        self.state["tax_rate_policy"] = dict(self.tax_rate_policy)
+        self.state["tax_rate_policy_file"] = {"path": str(path.resolve()), "sha256": file_sha256(path)}
+
     def _connect_browser(self) -> None:
         """Called only with the job lock held, before any live page work."""
         if self._needs_browser and self._browser_runner is None:
@@ -775,6 +824,7 @@ class OnlineRunner:
 
     def _new_state(self, mode: str) -> dict[str, Any]:
         return {"version": 1, "mode": mode, "date": self.date, **scope_fields(self.query_scope), "store": self.store,
+                "tax_rate_policy": dict(self.tax_rate_policy),
                 "agent_id": self.agent_id,
                 "expected_account": self.expected_account,
                 "plan_only": self.plan_only,
@@ -1172,6 +1222,7 @@ class OnlineRunner:
         self.generated_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
             "date": self.date, **scope_fields(self.query_scope), "store": self.store, "issuer": self.issuer,
+            "tax_rate_policy": dict(self.tax_rate_policy),
             "started_at": self.state["started_at"], "stage": "verified",
             "status": "no_applications", "replay": self.replay,
             "selected_count": 0, "ready_count": 0, "blocked_count": 0,
@@ -1182,6 +1233,12 @@ class OnlineRunner:
                               "sha256": file_sha256(self.input_dir / name)}
                        for name in ("capture_context.json", "applications.json", "common-export.bin")},
         }
+        previous_manifest = self.generated_dir / "run.json"
+        if (self.tax_rate_policy == {"source": "piaoju"} and previous_manifest.is_file()
+                and "tax_rate_policy" not in read_json(previous_manifest)):
+            # A legacy empty result can have been published just before its
+            # stage commit was interrupted. Keep those original bytes.
+            manifest.pop("tax_rate_policy")
         # Identical bytes also recover a crash after local publication but
         # before the generate stage was committed, without another export.
         self.invoker._commit_saved_bytes(self.generated_dir / "exceptions.csv",
@@ -1466,6 +1523,7 @@ class OnlineRunner:
                         note="仅采纳明确核对口径的金额证据；详情未提供证据时保留原逐票暂缓")
 
     def _run_invoice(self, output_dir: Path, plan_only: bool = False) -> Path:
+        self._bind_tax_rate_policy()
         if output_dir.exists():
             # run_invoice deliberately refuses to overwrite an output.  A
             # failed resumable run therefore gets a fresh sibling directory;
@@ -1486,7 +1544,8 @@ class OnlineRunner:
         scope_args = ["--all-pending"] if self.date is None else ["--date", self.date]
         args = [str(RUN_INVOICE), *scope_args, "--store", self.store,
                 "--issuer", self.issuer, "--input-dir", str(self.input_dir),
-                "--output-dir", str(output_dir)]
+                "--output-dir", str(output_dir),
+                "--tax-rate-policy-file", str(self.tax_rate_policy_path)]
         if plan_only:
             args.append("--plan-only")
         if self.replay:
@@ -1500,6 +1559,10 @@ class OnlineRunner:
 
     def _validate_input_hashes(self, check: bool = True) -> None:
         if check:
+            binding = self.state.get("tax_rate_policy_file")
+            if binding and (not self.tax_rate_policy_path.is_file()
+                            or file_sha256(self.tax_rate_policy_path) != binding.get("sha256")):
+                raise OnlineError("冻结税率策略文件发生变化", "resume_mismatch")
             for item in self.state.get("input_hashes", []):
                 path = Path(item["path"])
                 if not path.is_file() or file_sha256(path) != item["sha256"]:
@@ -1528,6 +1591,7 @@ class OnlineRunner:
     def run(self) -> dict[str, Any]:
         with ActiveLock(self.output_root) as lock:
             try:
+                self._bind_tax_rate_policy()
                 if lock.recovered_stale_lock:
                     self.state["recovered_stale_lock"] = {
                         "recovered_at": utc_now(), "reason": lock.stale_lock_reason,
@@ -1565,6 +1629,7 @@ class OnlineRunner:
                     self.state.pop(key, None)
                 self._write_state()
                 result = {"status": generated_manifest.get("status", "complete"),
+                          "tax_rate_policy": dict(self.tax_rate_policy),
                           "run_dir": str(self.run_dir), "generated_dir": str(self.generated_dir),
                           "run_manifest": str(self.generated_dir / "run.json"),
                           **{key: generated_manifest.get(key) for key in
@@ -1640,6 +1705,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"浏览器配置 JSON；未传时读取 {QIANNIU_BROWSER_CONFIG_ENV}")
     parser.add_argument("--jst-browser-config", type=Path,
                         help="可选的共享票聚浏览器配置；省略时使用同一浏览器的 goods 页")
+    parser.add_argument("--tax-rate-config", type=Path,
+                        help="按店铺税率配置；默认读取 skill 根目录 tax-rates.json，恢复时沿用冻结策略")
     parser.add_argument("--browser-backend", choices=("playwright",),
                         default="playwright",
                         help="兼容参数；唯一浏览器后端为 Playwright")
@@ -1707,6 +1774,7 @@ def main(argv: list[str] | None = None) -> int:
                               run_dir=args.run_dir, resume=args.resume, replay_input=args.replay_input,
                               browser_config=args.browser_config, browser_backend=args.browser_backend,
                               jst_browser_config=args.jst_browser_config,
+                              tax_rate_config=args.tax_rate_config,
                               node=args.node,
                               node_modules=args.node_modules,
                               plan_only=args.plan_only, connect_only=args.connect_only)

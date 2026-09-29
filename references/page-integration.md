@@ -104,6 +104,8 @@ https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId=<订单号>
 
 `old_details.json`、`supplemental_details.json` 必须合并消费，字段冲突不能静默覆盖。`order_evidence.py` 检查同一商品行原始价格、数量、来源 URL/时间及与源商品金额的唯一对应，推导证据写入 `derived_match_evidence.json`。列表金额、行顺序、金额大小均不能替代可靠关联；页面结构变化或证据不足则暂缓相关整票。
 
+详情运行时的 `itemInfo.extra` 是可选字段：无编码商品可能完全省略它。只有完整订单的字符串子订单号、标题、数量与全部 DOM 商品行唯一对应，且页面也未显示编码时，才能按缺码记录并由计划暂缓相关申请。显式 `null`、错误类型、DOM/运行时不一致或缺行仍阻断，不能用空数组掩盖加载异常。
+
 ## 票聚商品查询
 
 `query_jst_invoice_goods.js` 在商品 iframe 中执行，接收对象 `{codes, context: {coid, uid}}`，直接返回对象。请求为：

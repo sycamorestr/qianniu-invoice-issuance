@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "default": {"source": "fixed", "rate": "0.1"},
+  "stores": {
+    "按票聚税率的店铺全名": {"source": "piaoju"}
+  }
+}

@@ -38,7 +38,10 @@
   };
   const runtimeCode=subOrder=>{
     const entries=subOrder?.itemInfo?.extra;
-    // An absent/unloaded extra field is not evidence that the code is empty.
+    // Live detail responses omit optional extra when the rendered product
+    // has no code. Accept only after the full DOM/runtime match below;
+    // a malformed explicit value must still fail closed.
+    if(!Object.prototype.hasOwnProperty.call(subOrder.itemInfo,'extra'))return '';
     if(!Array.isArray(entries))throw Error('runtime_goods_code_not_loaded');
     const codes=entries.filter(entry=>entry&&entry.name==='商家编码');
     if(codes.length>1)throw Error('runtime_goods_code_conflict');
@@ -69,7 +72,7 @@
       // Code-less rows can include runtime item notices below the title.
       // Match the entire rendered first cell; never infer a title from only
       // a price/quantity row or ignore unexplained DOM text.
-      const rendered=[itemInfo.title,...itemInfo.extra.map(entry=>entry?.value??'')].map(text).filter(Boolean).join(' ');
+      const rendered=[itemInfo.title,...(itemInfo.extra??[]).map(entry=>entry?.value??'')].map(text).filter(Boolean).join(' ');
       return text(firstCell)===text(rendered);
     });
     if(candidates.length!==1)throw Error('runtime_sub_order_not_unique');

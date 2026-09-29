@@ -14,8 +14,9 @@ from pathlib import Path
 
 from browser_lock import FileMutex, FileMutexBusy
 from invoice_scope import resolve_scope, scope_fields, scope_from_record, scope_label
+from invoice_tax_policy import load_tax_rate_config, policy_for_store
 from run_online import (OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json,
-                        utc_now, stable_sha256, finalize_delivery)
+                        utc_now, stable_sha256, finalize_delivery, frozen_tax_rate_policy)
 from shop_registry import load_registry
 
 SUCCESS = {'complete', 'no_applications', 'all_excluded', 'all_blocked', 'plan_only'}
@@ -52,11 +53,18 @@ class BatchRunner:
                  resume: Path | None = None, shops: list[str] | None = None,
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False, connect_only: bool = False, all_pending: bool = False,
+                 tax_rate_config: Path | None = None,
                  runner_factory=OnlineRunner):
         self.registry = load_registry(registry)
         self.node, self.node_modules = node, node_modules
         self.runner_factory = runner_factory
         self.connect_only = connect_only
+        # Read once before any shop starts. A later edit must affect only a
+        # new batch, including when this batch still has unstarted shops.
+        try:
+            tax_config = load_tax_rate_config(tax_rate_config) if tax_rate_config is not None or not resume else None
+        except (ValueError, OSError, TypeError) as exc:
+            raise OnlineError(f'税率配置无效: {exc}', 'configuration') from exc
         if resume:
             self.run_dir = resume.resolve()
             self.state = read_json(self.run_dir / 'batch-state.json')
@@ -91,6 +99,9 @@ class BatchRunner:
                 # supplied before first collection; OnlineRunner separately
                 # rejects changes after an account context was committed.
                 saved.setdefault('login_username', expected.get('login_username', ''))
+                supplied = policy_for_store(tax_config, saved['store']) if tax_config is not None else None
+                saved['tax_rate_policy'] = frozen_tax_rate_policy(
+                    saved['store'], supplied_policy=supplied, saved=saved)
             self.node = node or self.state.get('node')
             self.node_modules = node_modules or self.state.get('node_modules')
             if plan_only and not self.state['plan_only']:
@@ -104,6 +115,7 @@ class BatchRunner:
             selected = shops if shops is not None else list(available)
             if not selected or len(set(selected)) != len(selected) or set(selected) - available.keys():
                 raise OnlineError('--shops 必须是清单中不重复的店铺 id', 'configuration')
+            policies = {sid: policy_for_store(tax_config, available[sid]['store']) for sid in selected}
             root = (output_root or Path(self.registry['output_root'])).resolve()
             self.run_dir = root / f'batch-{scope_label(self.query_scope)}-{datetime.now():%Y%m%d-%H%M%S-%f}'
             self.run_dir.mkdir(parents=True, exist_ok=False)
@@ -114,12 +126,13 @@ class BatchRunner:
                           'selected_shop_ids': selected, 'plan_only': plan_only,
                           'node': node, 'node_modules': node_modules,
                           'shops': [{**available[sid], 'status': 'pending', 'attempts': [],
+                                     'tax_rate_policy': policies[sid],
                                      'run_dir': str(self.run_dir / 'shops' / sid)} for sid in selected]}
         self.lock = FileMutex(self.run_dir / '.batch.lock')
 
     def save(self):
         publish_json(self.run_dir / 'batch-state.json', self.state)
-        rows = [{key: shop.get(key) for key in ('id', 'store', 'status', 'ready_count', 'ready_amount',
+        rows = [{key: shop.get(key) for key in ('id', 'store', 'status', 'tax_rate_policy', 'ready_count', 'ready_amount',
                     'blocked_count', 'blocked_amount', 'excluded_count', 'excluded_amount',
                     'elapsed_seconds', 'error_code', 'error_site', 'error', 'recovery_action',
                     'common_template', 'tax_template', 'exceptions', 'run_manifest')}
@@ -151,6 +164,13 @@ class BatchRunner:
         except ValueError as exc:
             raise OnlineError(f'成功店铺查询范围无效: {exc}', 'checkpoint_invalid') from exc
         paths = {state_path, run_dir / 'run.json'}
+        if state.get('tax_rate_policy_file'):
+            binding = state['tax_rate_policy_file']
+            path = run_dir / 'tax-rate-policy.json'
+            if (binding.get('path') != str(path.resolve()) or not path.is_file()
+                    or file_sha256(path) != binding.get('sha256')):
+                raise OnlineError('冻结税率策略文件缺失或变化', 'checkpoint_invalid')
+            paths.add(path)
         for item in state.get('input_hashes', []):
             paths.add(Path(item['path']))
         for stage in state.get('stages', {}).values():
@@ -213,7 +233,8 @@ class BatchRunner:
                                   output_root=self.run_dir / 'shops', browser_config=Path(shop['browser_config']),
                                   jst_browser_config=Path(self.registry['jst_browser_config']),
                                   node=self.node, node_modules=self.node_modules, plan_only=self.state['plan_only'],
-                                  connect_only=self.connect_only, query_scope=dict(self.query_scope))
+                                  connect_only=self.connect_only, query_scope=dict(self.query_scope),
+                                  tax_rate_policy=dict(shop['tax_rate_policy']))
                     if self.query_scope['mode'] == 'all_pending':
                         kwargs['all_pending'] = True
                     if shop.get('login_username'):
@@ -281,6 +302,8 @@ def main(argv=None):
     parser.add_argument('--output-root', type=Path)
     parser.add_argument('--node'); parser.add_argument('--node-modules')
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--tax-rate-config', type=Path,
+                        help='按店铺税率配置；默认读取 skill 根目录 tax-rates.json，整批开始前冻结各店策略')
     parser.add_argument('--notification-config', type=Path,
                         help='企微推送私有配置；默认读取 skill 根目录的 notifications.json，缺失时兼容店铺清单旁的旧配置')
     parser.add_argument('--no-notify', action='store_true', help='仅整理交付压缩包，不向企微发送')

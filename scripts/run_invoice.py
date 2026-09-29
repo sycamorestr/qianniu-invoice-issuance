@@ -16,6 +16,7 @@ from zipfile import ZipFile
 
 import build_invoice_plan as rules
 from invoice_scope import make_scope, resolve_scope, scope_from_record, scope_label, scope_fields, scope_date_range
+from invoice_tax_policy import normalize_policy, resolve_tax_rate_policy
 from order_evidence import merge_order_details, derive_amount_evidence, attach_amount_evidence
 from template_io import (BASIC, DETAIL, SHEETS, inspect_template, make_output_rows,
                          is_ready_for_export, prepare, finalize, read_rows, require, sheet_paths, Q, ET)
@@ -239,6 +240,11 @@ def scope_from_args(args):
 
 def assemble(args, common_template=None):
     root=args.input_dir
+    policy_file=getattr(args,'tax_rate_policy_file',None)
+    policy_config=getattr(args,'tax_rate_config',None)
+    require(not (policy_file and policy_config),'税率配置与冻结策略不能同时指定')
+    tax_policy=(normalize_policy(load(policy_file)) if policy_file
+                else resolve_tax_rate_policy(args.store,policy_config))
     scope=scope_from_args(args)
     context_path=root/'capture_context.json'
     if 'countdown' in scope:
@@ -292,7 +298,7 @@ def assemble(args, common_template=None):
             require(str(app['tid'])==row['订单编号'],'申请列表与通用模板订单不一致')
     # Source order is authoritative, independent of list-page ordering.
     if not selected:
-        empty_run={'mode':'preview','store_name':args.store}
+        empty_run={'mode':'preview','store_name':args.store,'tax_rate_policy':tax_policy}
         if scope_fields(scope):
             empty_run.update(**scope_fields(scope),apply_date_range=scope_date_range(scope))
         return {'run':empty_run,'selected_application_ids':[],
@@ -304,7 +310,7 @@ def assemble(args, common_template=None):
     if not active_pending_rows:
         return {'run':{'mode':'preview','run_id':args.output_dir.name,
                        'apply_date_range':scope_date_range(scope),**scope_fields(scope),
-                       'store_name':args.store,'issuer_name':args.issuer,
+                       'store_name':args.store,'issuer_name':args.issuer,'tax_rate_policy':tax_policy,
                        'application_snapshot_at':applications['queried_at']},
                 'selected_application_ids':selected,'template_rows':pending_rows,
                 'ignored_template_rows':ignored_rows,'order_items':[],'order_goods':[],
@@ -365,7 +371,8 @@ def assemble(args, common_template=None):
                 require(len(candidates)==1 and candidates[0]==match,'票聚规范化候选不唯一或匹配证据被改写')
             goods.append({**match,'_input_goods_code':r['input_goods_code'],'_match_basis':basis})
     return {'run':{'mode':'preview','run_id':args.output_dir.name,'apply_date_range':scope_date_range(scope),**scope_fields(scope),
-                   'store_name':args.store,'issuer_name':args.issuer,'application_snapshot_at':applications['queried_at']},
+                   'store_name':args.store,'issuer_name':args.issuer,'tax_rate_policy':tax_policy,
+                   'application_snapshot_at':applications['queried_at']},
             'selected_application_ids':selected,'template_rows':pending_rows,'order_items':normalized,
             'order_goods':[{'order_no':i['order_no'],'goods_code':i['goods_code']} for i in normalized],
             'jst_invoice_goods':goods,'selection':selection,
@@ -387,6 +394,11 @@ def build_plan(source,output):
 
 def verify_sources(source,plan):
     """Check each mapped line against independent raw normalized evidence."""
+    source_run=source.get('run') or {}
+    policy=normalize_policy(source_run.get('tax_rate_policy'))
+    fixed_rate=policy['source']=='fixed'
+    if 'tax_rate_policy' in plan:
+        require(normalize_policy(plan['tax_rate_policy'])==policy,'计划税率策略与输入不一致')
     raw={r['__source_row']:r for r in source['template_rows']}
     ready=[i for i in plan['invoices'] if is_ready_for_export(i)]
     for invoice in plan['invoices']:
@@ -478,25 +490,48 @@ def verify_sources(source,plan):
                 require(False,'票聚匹配依据无效')
             for key,field in [('item_name','invoice_name'),('tax_classification_code','tax_code'),('specification','properties_value'),('unit','issuing_office')]:
                 require((line[key] or '')==(g.get(field) or '').strip(),'票聚字段来源不一致: '+field)
-            rate=g.get('tax_rate')
-            if rate is None:
-                category=g.get('vc_name','')
-                if category=='零税率':rate=Decimal(0)
+                if key!='specification':
+                    require(bool((g.get(field) or '').strip()),'票聚必需字段为空: '+field)
+            if fixed_rate:
+                rate=Decimal(policy['rate'])
+                expected_rate_source='store_fixed'
+            else:
+                raw_rate=rules.value(g,'tax_rate')
+                category=rules.clean_text(rules.value(g,'virtual_category')) or ''
+                if rules.clean_text(raw_rate) is None:
+                    expected_rate_source='jst_virtual_category'
+                    if category=='零税率':rate=Decimal(0)
+                    else:
+                        match=re.fullmatch(r'(\d+(?:\.\d+)?)\s*%\s*(?:税率)?',category)
+                        require(match is not None,'无法独立核对税率')
+                        rate=Decimal(match[1])/100
                 else:
-                    match=re.fullmatch(r'(\d+(?:\.\d+)?)\s*%\s*(?:税率)?',category)
-                    require(match is not None,'无法独立核对税率')
-                    rate=Decimal(match[1])/100
-            else: rate=Decimal(str(rate))
+                    expected_rate_source='jst_tax_rate'
+                    try:rate=Decimal(str(raw_rate))
+                    except InvalidOperation:raise ValueError('无法独立核对税率') from None
+                require(rate.is_finite() and Decimal(0)<=rate<=Decimal(1),'票聚税率必须为0到1的有限小数')
+                require(category!='零税率' or rate==0,'票聚零税率分类与显式税率冲突')
+                source_rate=rules.value(row,'tax_rate')
+                if rules.clean_text(source_rate) is not None:
+                    errors=[]
+                    require(rules.parse_tax_rate(source_rate,errors)==rate and not errors,'商品源行税率不一致')
             require(line['tax_rate']==rules.decimal_text(rate),'税率不一致')
+            if fixed_rate or 'tax_rate_policy' in source_run or 'tax_rate_source' in line or 'tax_rate_effective' in line:
+                require(line.get('tax_rate_source')==expected_rate_source,'税率来源不一致')
+                require(line.get('tax_rate_effective')==rules.decimal_text(rate),'有效税率不一致')
             for rn in fee_refs:
                 fee_rate=rules.value(fee_rows[rn],'tax_rate')
-                if rules.clean_text(fee_rate) is not None:
+                if not fixed_rate and rules.clean_text(fee_rate) is not None:
                     errors=[]
                     require(rules.parse_tax_rate(fee_rate,errors)==rate and not errors,'价外费用税率不一致')
             discount=Decimal(line['discount_amount']); dr=line['discount_source_row']
             if dr is not None:
                 require(dr==line['source_row']+1 and raw[dr]['申请流水号']==serial,'折扣源行归属不正确')
                 require(discount==Decimal(raw[dr]['商品金额']),'折扣金额被改写')
+                discount_rate=rules.value(raw[dr],'tax_rate')
+                if not fixed_rate and rules.clean_text(discount_rate) is not None:
+                    errors=[]
+                    require(rules.parse_tax_rate(discount_rate,errors)==rate and not errors,'折扣税率不一致')
             else: require(discount==0,'折扣没有源行')
             total+=Decimal(line['amount'])+discount
         require(used_fees==set(fee_rows),'价外费用源行覆盖不完整')
@@ -533,6 +568,9 @@ def main():
     query.add_argument('--date')
     query.add_argument('--all-pending',action='store_true',help='使用采集时冻结的最近两个月范围，按通用模板待处理状态选择')
     p.add_argument('--store',required=True);p.add_argument('--issuer',required=True)
+    tax=p.add_mutually_exclusive_group()
+    tax.add_argument('--tax-rate-config',type=Path,help='按店税率配置；默认使用skill根tax-rates.json')
+    tax.add_argument('--tax-rate-policy-file',type=Path,help=argparse.SUPPRESS)
     p.add_argument('--input-dir',required=True,type=Path);p.add_argument('--output-dir',required=True,type=Path)
     p.add_argument('--template',type=Path,default=DEFAULT_TEMPLATE,help='可选；默认使用skill内置V260401税局模板')
     p.add_argument('--node',type=Path);p.add_argument('--node-modules',type=Path)
@@ -562,6 +600,7 @@ def main():
         manifest['template_sha256']=sha(args.template)
         manifest['template_path']=str(args.template.resolve())
         source=assemble(args,common_output)
+        manifest['tax_rate_policy']=source['run']['tax_rate_policy']
         save(args.output_dir/'derived_match_evidence.json',{
             'evidence':source.get('derived_match_evidence',[]),
             'diagnostics':source.get('match_evidence_diagnostics',[])})

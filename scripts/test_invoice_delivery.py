@@ -49,7 +49,7 @@ class DeliveryTests(unittest.TestCase):
         exception_amount = (str(sum((Decimal(row[1]) for row in exception_rows), Decimal(0)))
                             if all(row[1] for row in exception_rows) else None)
         manifest = {'date': '2026-09-25', 'query_scope': self.scope,
-                    'status': status, 'store': '醉语阁', 'issuer': '测试公司',
+                    'status': status, 'store': '示例店铺', 'issuer': '测试公司',
                     'selected_count': ready_count + blocked_count + excluded_count,
                     'ready_count': ready_count, 'ready_amount': '12.30' if ready_count else '0',
                     'blocked_count': blocked_count, 'blocked_amount': exception_amount if blocked_count else '0',
@@ -94,7 +94,7 @@ class DeliveryTests(unittest.TestCase):
         for index, status in enumerate(statuses, 1):
             sid = f'shop{index:02}'
             child = batch / 'shops' / sid
-            row = {'id': sid, 'store': '醉语阁', 'status': status, 'run_dir': str(child),
+            row = {'id': sid, 'store': '示例店铺', 'status': status, 'run_dir': str(child),
                    'error': 'SECRET-ERROR'}
             if status in delivery.SUCCESS:
                 self.make_run(child, status=status)
@@ -215,7 +215,7 @@ class DeliveryTests(unittest.TestCase):
         result = delivery.deliver_result(run)
         self.assertEqual(result['status'], 'deferred')
         names, content = self.names(result)
-        self.assertTrue(any(n.startswith('shop01_醉语阁/') for n in names))
+        self.assertTrue(any(n.startswith('shop01_示例店铺/') for n in names))
         self.assertFalse(any(n.startswith(('shop02_', 'shop03_')) for n in names))
         self.assertNotIn(b'SECRET', content)
         with zipfile.ZipFile(result['zip_path']) as archive:
@@ -292,14 +292,14 @@ class DeliveryTests(unittest.TestCase):
         run = self.make_run()
         package = delivery.deliver_result(run, package_only=True)
         filename = Path(package['zip_path']).name
-        self.assertTrue(filename.startswith('千牛平台_醉语阁_开票汇总_2026-09-25_'))
+        self.assertTrue(filename.startswith('千牛平台_示例店铺_开票汇总_2026-09-25_'))
         url = json.loads(self.config.read_text())['wecom']['webhook_url']
         destination = hashlib.sha256(url.encode()).hexdigest()
         receipt_id = hashlib.sha256((package['zip_sha256'] + ':' + destination).encode()).hexdigest()
         write_json(run / 'delivery' / f'receipt-{receipt_id}.json', {
             'status': 'sent', 'zip_sha256': package['zip_sha256'],
             'destination_sha256': destination,
-            'zip_path': str(run / 'delivery' / '醉语阁_开票资料_旧文件名.zip')})
+            'zip_path': str(run / 'delivery' / '示例店铺_开票资料_旧文件名.zip')})
         with patch.object(delivery, '_request') as network:
             result = delivery.deliver_result(run, self.config)
         self.assertEqual(result['status'], 'sent')
@@ -341,7 +341,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertIn('/upload_media?', upload.args[0])
         self.assertTrue(upload.args[0].endswith('&type=file'))
         self.assertIn(b'name="media"', upload.args[1])
-        self.assertIn('醉语阁'.encode(), upload.args[1])
+        self.assertIn('示例店铺'.encode(), upload.args[1])
         self.assertEqual(json.loads(send.args[1]), {'msgtype': 'file', 'file': {'media_id': 'MEDIA'}})
         receipt = Path(first['receipt_path']).read_text(encoding='utf-8')
         self.assertNotIn('fake-test-key', receipt)
