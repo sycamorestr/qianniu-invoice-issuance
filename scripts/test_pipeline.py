@@ -399,6 +399,29 @@ def test_mixed_positive_and_negative_invoices_only_output_positive_rows():
     assert rows[SHEETS[1]][0]['金额']=='75.30'
     assert rows[SHEETS[1]][0]['折扣金额']=='-4.00'
 
+def test_paper_ordinary_request_reaches_template_rows_and_preserves_raw_type():
+    for policy in ({'source':'piaoju'}, {'source':'fixed','rate':'0.1'}):
+        source,_=fee_verification_fixture()
+        source['template_rows'][0].update({'发票类型':'增值税纸质普通发票','抬头类型':'个人'})
+        source['run']={'mode':'preview','store_name':'test','tax_rate_policy':policy}
+        original=deepcopy(source)
+        build=rules.InvoiceBuild('A-1',[(r['__source_row'],r) for r in source['template_rows']])
+        invoice=rules.build_invoice(build,{'O-1':{'SKU-1'}},rules.make_jst_index(source['jst_invoice_goods']),
+                                    source['run'],rules.make_order_items_index(source['order_items']))
+        assert not invoice['errors'],invoice['errors']
+        plan={'invoices':[invoice],'selected_application_ids':['A-1'],'tax_rate_policy':policy,
+              'fatal':False,'errors':[]}
+        assert verify_sources(source,plan)==[invoice]
+        rows=make_output_rows(plan)
+        assert len(rows[SHEETS[0]])==len(rows[SHEETS[1]])==1
+        assert rows[SHEETS[0]][0]['发票类型']=='普通发票'
+        assert rows[SHEETS[1]][0]['税率']==('0.1' if policy['source']=='fixed' else '0.13')
+        assert rules.Decimal(rows[SHEETS[1]][0]['金额'])==rules.Decimal('75.30')
+        assert rules.Decimal(rows[SHEETS[1]][0]['折扣金额'])==rules.Decimal('-4.00')
+        assert rows[SHEETS[2]]==rows[SHEETS[3]]==[]
+        assert source==original
+
+
 def test_zero_tax_rate_is_explicit_and_blank_is_rejected():
     source,plan=fee_verification_fixture()
     source['jst_invoice_goods'][0]['tax_rate']='0'

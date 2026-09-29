@@ -87,6 +87,46 @@ def test_valid_positive_and_discount() -> None:
     assert invoice["status"] == "ready_for_export"
 
 
+def test_paper_ordinary_request_maps_to_digital_ordinary_without_changing_source() -> None:
+    source = valid_source()
+    baseline = build(source)
+    source['template_rows'][0]['发票类型'] = '增值税纸质普通发票'
+    original = deepcopy(source)
+    invoice = build(source)
+    assert invoice['errors'] == [], invoice['errors']
+    assert invoice['status'] == 'ready_for_export'
+    assert invoice['basic']['invoice_type'] == '普通发票'
+    assert invoice['detail_lines'] == baseline['detail_lines']
+    assert invoice['invoice_total_amount'] == baseline['invoice_total_amount']
+    assert source == original
+
+
+def test_paper_ordinary_request_keeps_missing_goods_code_and_unit_blocked() -> None:
+    for missing in ('goods_code', 'unit'):
+        source = valid_source()
+        source['template_rows'][0]['发票类型'] = '增值税纸质普通发票'
+        if missing == 'goods_code':
+            source['order_items'] = [{'order_no': 'O-1', 'goods_code': '',
+                                      'sub_order_no': 'S-1', 'quantity': '7'}]
+            expected = '缺少商家编码'
+        else:
+            source['jst_invoice_goods'][0]['开票单位'] = ''
+            expected = '缺少unit'
+        invoice = build(source)
+        assert invoice['status'] == 'blocked', invoice
+        assert any(expected in error for error in invoice['errors']), invoice
+        assert not any('发票类型' in error for error in invoice['errors']), invoice
+
+
+def test_paper_ordinary_alias_does_not_accept_other_unknown_invoice_types() -> None:
+    for invoice_type in ('增值税纸质专用发票', '未知普通发票'):
+        source = valid_source()
+        source['template_rows'][0]['发票类型'] = invoice_type
+        invoice = build(source)
+        assert invoice['status'] == 'blocked'
+        assert any('发票类型不在模板允许值内' in error for error in invoice['errors'])
+
+
 def test_multiple_positive_rows_keep_same_invoice_group() -> None:
     source = valid_source()
     source["template_rows"] = [

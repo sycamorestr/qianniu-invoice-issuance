@@ -167,6 +167,9 @@ def normalize_invoice_type(raw: Any, errors: list[str]) -> str | None:
     mapping = {
         "普通发票": "普通发票",
         "增值税普通发票": "普通发票",
+        # The agreed workflow fulfils paper ordinary invoice requests with
+        # digital ordinary invoices through the tax-bureau import template.
+        "增值税纸质普通发票": "普通发票",
         "增值税电子普通发票": "普通发票",
         "全电普通发票": "普通发票",
         "数电普通发票": "普通发票",

@@ -117,7 +117,7 @@ if (-not (Test-Path -LiteralPath $config)) {
 
 ## 恢复与离线复核
 
-税率可在技能根目录 `tax-rates.json` 配置：用 `default` 指定默认固定税率（如 `0.1` 表示 10%），用 `stores` 为个别店铺选择票聚税率或其他固定值。首次复制 `assets/tax-rates.example.json` 后按完整店铺名修改；没有配置时仍按原规则取票聚。单店、多店均自动读取，也支持 `--tax-rate-config`。真实配置不上传 GitHub，迁移时随技能目录保留。配置和生效时机见[按店铺配置税率](references/tax-rates.md)。
+税率可在技能根目录 `tax-rates.json` 配置：用 `default` 指定默认固定税率（示例默认 `0.01` 表示 1%），用 `stores` 为个别店铺选择票聚税率或其他固定值。首次复制 `assets/tax-rates.example.json` 后按完整店铺名修改；没有配置时仍按原规则取票聚。单店、多店均自动读取，也支持 `--tax-rate-config`。真实配置不上传 GitHub，迁移时随技能目录保留。配置和生效时机见[按店铺配置税率](references/tax-rates.md)。
 
 修复登录或环境问题后，用原作业目录恢复。不要编辑原始检查点：
 

@@ -16,6 +16,8 @@
 
 collection_files.py orders 写入 selection.json，绑定通用模板 SHA-256、源行数、状态分布、待处理源行数、流水号顺序和忽略状态；started模式额外保存 query_scope、applications_sha256、raw_pending_source_row_count、raw_pending_application_ids、filtered_out_countdown_application_ids 和 filtered_out_countdown_rows。倒计时未入选申请不计入 ready/blocked/excluded。订单、商品编码和票聚汇总检查点继承选择哈希；下游重新核对原件与筛选证据。原始通用模板始终字节不变，可能包含未入选申请。
 
+发票类型按[字段映射](flow-and-field-mapping.md)规范化。“增值税纸质普通发票”申请已约定按数电普通发票生成，写入模板的值为“普通发票”；原始申请类型保留。票种映射完成后仍须执行下述商品及其他逐票校验。
+
 ## 2. 商品行匹配
 
 商品关联粒度为“申请流水号＋源行号→订单明细→完整商品编码”。同一个订单可以多个商品编码；同一编码也可能多个子订单，不能只按编码去重。
