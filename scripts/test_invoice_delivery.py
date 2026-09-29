@@ -24,7 +24,8 @@ class DeliveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Windows runners may expose TEMP through an 8.3 alias.
+        self.root = Path(self.temp.name).resolve()
         self.scope = {'mode': 'date', 'date': '2026-09-25', 'countdown': 'started'}
         self.config = self.root / 'notifications.json'
         write_json(self.config, {'schema_version': 1, 'wecom': {

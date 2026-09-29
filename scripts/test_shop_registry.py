@@ -69,7 +69,8 @@ class WorkbenchRegistryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Windows runners may expose TEMP through an 8.3 alias.
+        self.root = Path(self.temp.name).resolve()
         self.registry = self.root / 'shops.json'
         self.sidecar = self.root / '.browser-workbench-shops.json'
         self.config('piaoju', {'goods': {'url': GOODS}}, 9440)
