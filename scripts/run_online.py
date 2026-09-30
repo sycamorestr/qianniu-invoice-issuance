@@ -3,9 +3,9 @@
 The browser adapter is deliberately a small in-process boundary: it receives
 one request file and returns business data. The runner persists that response
 as an immutable raw checkpoint. Everything after that boundary is local and
-resumable. This module never
-submits an invoice; it only collects the read-only inputs and delegates final
-workbook creation to :mod:`run_invoice`.
+resumable. This module agrees to selected applications after preserving their
+original export, but never submits an invoice. Final workbook creation is
+delegated to :mod:`run_invoice`.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ RUN_INVOICE = HERE / "run_invoice.py"
 # The JST page script uses eight workers. Forty codes keep each response a
 # bounded recovery unit while avoiding unnecessary page-evaluate round trips.
 JST_BATCH_SIZE = 40
+APPROVAL_BATCH_MODES = {"single_request", "legacy_20"}
 QIANNIU_BROWSER_CONFIG_ENV = "QIANNIU_BROWSER_CONFIG"
 SUPPORTED_BROWSER_CONFIG_SCHEMA = 1
 
@@ -286,6 +287,9 @@ def validate_raw_payload(site: str, operation: str, value: Any,
                 raise ValueError('申请快照与请求的查询范围不一致')
         except ValueError as exc:
             raise OnlineError(str(exc), "checkpoint_invalid") from exc
+    if site == "qianniu" and operation in {"approval-status", "approve"}:
+        from invoice_approval import validate_response
+        validate_response(operation, value, request, error_type=OnlineError)
     if site == "jst" and operation == "query":
         rows = value.get("data")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -604,6 +608,8 @@ class OnlineRunner:
                  browser_backend: str | None = None,
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False,
+                 approve_applications: bool | None = None,
+                 approval_batch_mode: str | None = None,
                  connect_only: bool = False,
                  adapter_runner: Callable[[str, str, Path, Path], Any] | None = None) -> None:
         if resume and replay_input:
@@ -639,6 +645,13 @@ class OnlineRunner:
         self.output_root = Path(output_root).resolve()
         self.replay = replay_input is not None
         self.plan_only = plan_only
+        if approve_applications is not None and type(approve_applications) is not bool:
+            raise OnlineError("approve_applications 必须为布尔值", "configuration")
+        self.approve_applications = True if approve_applications is None else approve_applications
+        if approval_batch_mode is not None and (
+                not isinstance(approval_batch_mode, str) or approval_batch_mode not in APPROVAL_BATCH_MODES):
+            raise OnlineError("approval_batch_mode 无效", "configuration")
+        self.approval_batch_mode = approval_batch_mode or "single_request"
         self.connect_only = connect_only
         self.node = node
         self.node_modules = node_modules
@@ -711,6 +724,18 @@ class OnlineRunner:
             self.state = old
             self.replay = old.get("mode") == "replay"
             self.plan_only = bool(old.get("plan_only", False))
+            saved_approval = old.get("approve_applications", False)
+            if type(saved_approval) is not bool:
+                raise OnlineError("保存的批量同意策略无效", "checkpoint_invalid")
+            if approve_applications is not None and approve_applications != saved_approval:
+                raise OnlineError("恢复时不能改变批量同意策略", "resume_mismatch")
+            self.approve_applications = saved_approval
+            saved_batch_mode = old.get("approval_batch_mode", "legacy_20")
+            if not isinstance(saved_batch_mode, str) or saved_batch_mode not in APPROVAL_BATCH_MODES:
+                raise OnlineError("保存的批量同意分批策略无效", "checkpoint_invalid")
+            if approval_batch_mode is not None and approval_batch_mode != saved_batch_mode:
+                raise OnlineError("恢复时不能改变批量同意分批策略", "resume_mismatch")
+            self.approval_batch_mode = saved_batch_mode
             self.node = self.node or old.get("node")
             self.node_modules = self.node_modules or old.get("node_modules")
             if self.agent_id is not None and self.agent_id != old.get("agent_id"):
@@ -828,6 +853,8 @@ class OnlineRunner:
                 "agent_id": self.agent_id,
                 "expected_account": self.expected_account,
                 "plan_only": self.plan_only,
+                "approve_applications": self.approve_applications and not self.replay and not self.plan_only,
+                "approval_batch_mode": self.approval_batch_mode,
                 "issuer": self.issuer, "requested_issuer": self.requested_issuer,
                 "run_dir": str(self.run_dir),
                 "input_dir": str(self.input_dir), "generated_dir": str(self.generated_dir),
@@ -1246,15 +1273,25 @@ class OnlineRunner:
         self.invoker._commit_saved_bytes(self.generated_dir / "run.json",
                                         (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
-    def _orders(self, force: bool = False) -> None:
-        if self.stage_is_done("orders") and not force:
-            return
-        self.stage_start("orders", kind="remerge" if force else None)
+    def _prepare_selection(self) -> None:
         order_ids_path = self.input_dir / "order_ids.json"
         if not self.stage_is_done("orders_prepare"):
             self.stage_start("orders_prepare")
             self.run_script([str(COLLECTOR), "orders", "--run-dir", str(self.input_dir)], "selection")
             self.stage_done("orders_prepare", [order_ids_path, self.input_dir / "selection.json"])
+
+    def _approve_applications(self) -> None:
+        if not self.approve_applications or self.replay or self.plan_only:
+            return
+        from invoice_approval import approve_selected
+        approve_selected(self, api=sys.modules[__name__])
+
+    def _orders(self, force: bool = False) -> None:
+        if self.stage_is_done("orders") and not force:
+            return
+        self.stage_start("orders", kind="remerge" if force else None)
+        self._prepare_selection()
+        order_ids_path = self.input_dir / "order_ids.json"
         order_ids = read_json(order_ids_path)
         orders = list(order_ids.get("orders", []))
         if not orders:
@@ -1606,6 +1643,7 @@ class OnlineRunner:
                     self._applications_export()
                     empty_export = self._empty_export_evidence()
                     if empty_export is None:
+                        self._approve_applications()
                         self._orders()
                         self._jst()
                         self._probe_and_details()

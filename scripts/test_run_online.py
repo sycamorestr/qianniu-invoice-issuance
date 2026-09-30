@@ -58,6 +58,49 @@ class RunOnlineTests(unittest.TestCase):
         run_online.atomic_json(runner.input_dir / "capture_context.json", {"coid": "c", "uid": "u"})
         run_online.atomic_json(runner.input_dir / "goods_codes.json", {"codes": codes})
 
+    def test_approval_batch_mode_is_frozen_and_legacy_resume_stays_twenty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for mode in (None, "legacy_20"):
+                with self.subTest(mode=mode):
+                    runner = self.make_runner(root, FakeAdapter(), approval_batch_mode=mode)
+                    expected = mode or "single_request"
+                    self.assertEqual(runner.state["approval_batch_mode"], expected)
+                    resumed = self.make_runner(root, FakeAdapter(), resume=runner.run_dir)
+                    self.assertEqual(resumed.approval_batch_mode, expected)
+                    changed = "legacy_20" if expected == "single_request" else "single_request"
+                    with self.assertRaises(run_online.OnlineError) as caught:
+                        self.make_runner(root, FakeAdapter(), resume=runner.run_dir,
+                                         approval_batch_mode=changed)
+                    self.assertEqual(caught.exception.code, "resume_mismatch")
+            runner = self.make_runner(root, FakeAdapter())
+            runner.state.pop("approval_batch_mode")
+            runner._write_state()
+            resumed = self.make_runner(root, FakeAdapter(), resume=runner.run_dir)
+            self.assertEqual(resumed.approval_batch_mode, "legacy_20")
+            self.assertNotIn("approval_batch_mode", resumed.state)
+            with self.assertRaises(run_online.OnlineError) as caught:
+                self.make_runner(root, FakeAdapter(), resume=runner.run_dir,
+                                 approval_batch_mode="single_request")
+            self.assertEqual(caught.exception.code, "resume_mismatch")
+
+    def test_invalid_approval_batch_mode_fails_before_browser_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for value in ("", "all", 20, [], {}):
+                with self.subTest(value=value):
+                    with self.assertRaises(run_online.OnlineError) as caught:
+                        self.make_runner(root, FakeAdapter(), approval_batch_mode=value)
+                    self.assertEqual(caught.exception.code, "configuration")
+            runner = self.make_runner(root, FakeAdapter())
+            for value in (None, "", "all", 20, [], {}):
+                with self.subTest(saved=value):
+                    runner.state["approval_batch_mode"] = value
+                    runner._write_state()
+                    with self.assertRaises(run_online.OnlineError) as caught:
+                        self.make_runner(root, FakeAdapter(), resume=runner.run_dir)
+                    self.assertEqual(caught.exception.code, "checkpoint_invalid")
+
     def export_adapter(self, calls, content=b"", applications=None):
         fake = FakeAdapter()
         def adapter(site, operation, input_path, output_path):
@@ -337,6 +380,7 @@ class RunOnlineTests(unittest.TestCase):
                 (output / "qianniu_invoice_tax_template_all-pending.xlsx").write_bytes(b"synthetic result")
                 return output
             with patch.object(runner, "_context"), patch.object(runner, "_applications_export"), \
+                    patch.object(runner, "_approve_applications"), \
                     patch.object(runner, "_orders"), patch.object(runner, "_jst"), \
                     patch.object(runner, "_probe_and_details"), patch.object(runner, "_run_invoice", side_effect=generate):
                 self.assertEqual(runner.run()["status"], "complete")

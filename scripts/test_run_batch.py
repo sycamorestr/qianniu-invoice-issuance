@@ -109,6 +109,69 @@ class BatchTests(unittest.TestCase):
         self.batch(replay, resume=batch.run_dir).run()
         self.assertEqual(replay.calls, [])
 
+    def test_approval_policy_is_frozen_for_new_legacy_and_plan_batches(self):
+        for legacy, plan_only, expected in ((False, False, True), (True, False, False),
+                                            (False, True, False)):
+            with self.subTest(legacy=legacy, plan_only=plan_only):
+                batch = self.batch(Jobs(), shops=['shop01'], plan_only=plan_only)
+                if legacy:
+                    batch.state.pop('approve_applications')
+                batch.save()
+                jobs = Jobs()
+                self.batch(jobs, date=None, resume=batch.run_dir).run()
+                self.assertIs(jobs.calls[0]['approve_applications'], expected)
+
+    def test_unknown_approval_stops_batch_before_next_shop(self):
+        class UnknownApproval(Jobs):
+            def run(self):
+                raise OnlineError('uncertain write', 'approval_unknown', site='qianniu')
+        jobs = UnknownApproval()
+        result = self.batch(jobs).run()
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(len(jobs.calls), 1)
+        self.assertEqual(result['shops'][0]['error_code'], 'approval_unknown')
+
+    def test_approval_batch_mode_is_frozen_and_forwarded_to_unstarted_shops(self):
+        for mode in (None, 'legacy_20'):
+            with self.subTest(mode=mode):
+                batch = self.batch(Jobs(), shops=['shop01'], approval_batch_mode=mode)
+                expected = mode or 'single_request'
+                self.assertEqual(batch.state['approval_batch_mode'], expected)
+                batch.save()
+                changed = 'legacy_20' if expected == 'single_request' else 'single_request'
+                with self.assertRaises(OnlineError) as caught:
+                    self.batch(Jobs(), resume=batch.run_dir, approval_batch_mode=changed)
+                self.assertEqual(caught.exception.code, 'resume_mismatch')
+                jobs = Jobs()
+                self.batch(jobs, resume=batch.run_dir).run()
+                self.assertEqual(jobs.calls[0]['approval_batch_mode'], expected)
+        batch = self.batch(Jobs(), shops=['shop01'])
+        batch.state.pop('approval_batch_mode')
+        batch.save()
+        jobs = Jobs()
+        resumed = self.batch(jobs, resume=batch.run_dir)
+        self.assertNotIn('approval_batch_mode', resumed.state)
+        resumed.run()
+        self.assertEqual(jobs.calls[0]['approval_batch_mode'], 'legacy_20')
+        with self.assertRaises(OnlineError) as caught:
+            self.batch(Jobs(), resume=batch.run_dir, approval_batch_mode='single_request')
+        self.assertEqual(caught.exception.code, 'resume_mismatch')
+
+    def test_invalid_approval_batch_mode_rejected(self):
+        for value in ('', 'all', 20, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(OnlineError) as caught:
+                    self.batch(Jobs(), approval_batch_mode=value)
+                self.assertEqual(caught.exception.code, 'configuration')
+        batch = self.batch(Jobs(), shops=['shop01'])
+        for value in (None, '', 'all', 20, [], {}):
+            with self.subTest(saved=value):
+                batch.state['approval_batch_mode'] = value
+                batch.save()
+                with self.assertRaises(OnlineError) as caught:
+                    self.batch(Jobs(), resume=batch.run_dir)
+                self.assertEqual(caught.exception.code, 'checkpoint_invalid')
+
     def test_all_pending_scope_routes_to_shops_and_proves_labelled_outputs(self):
         jobs = Jobs()
         batch = self.batch(jobs, date=None, all_pending=True, shops=['shop01', 'shop02'])

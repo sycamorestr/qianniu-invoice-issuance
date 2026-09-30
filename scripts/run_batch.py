@@ -16,7 +16,8 @@ from browser_lock import FileMutex, FileMutexBusy
 from invoice_scope import resolve_scope, scope_fields, scope_from_record, scope_label
 from invoice_tax_policy import load_tax_rate_config, policy_for_store
 from run_online import (OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json,
-                        utc_now, stable_sha256, finalize_delivery, frozen_tax_rate_policy)
+                        utc_now, stable_sha256, finalize_delivery, frozen_tax_rate_policy,
+                        APPROVAL_BATCH_MODES)
 from shop_registry import load_registry
 
 SUCCESS = {'complete', 'no_applications', 'all_excluded', 'all_blocked', 'plan_only'}
@@ -54,11 +55,16 @@ class BatchRunner:
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False, connect_only: bool = False, all_pending: bool = False,
                  tax_rate_config: Path | None = None,
+                 approval_batch_mode: str | None = None,
                  runner_factory=OnlineRunner):
         self.registry = load_registry(registry)
         self.node, self.node_modules = node, node_modules
         self.runner_factory = runner_factory
         self.connect_only = connect_only
+        if approval_batch_mode is not None and (
+                not isinstance(approval_batch_mode, str) or approval_batch_mode not in APPROVAL_BATCH_MODES):
+            raise OnlineError('approval_batch_mode 无效', 'configuration')
+        self.approval_batch_mode = approval_batch_mode or 'single_request'
         # Read once before any shop starts. A later edit must affect only a
         # new batch, including when this batch still has unstarted shops.
         try:
@@ -106,6 +112,14 @@ class BatchRunner:
             self.node_modules = node_modules or self.state.get('node_modules')
             if plan_only and not self.state['plan_only']:
                 raise OnlineError('恢复不能改变 plan-only 模式', 'resume_mismatch')
+            if type(self.state.get('approve_applications', False)) is not bool:
+                raise OnlineError('保存的批量同意策略无效', 'checkpoint_invalid')
+            saved_batch_mode = self.state.get('approval_batch_mode', 'legacy_20')
+            if not isinstance(saved_batch_mode, str) or saved_batch_mode not in APPROVAL_BATCH_MODES:
+                raise OnlineError('保存的批量同意分批策略无效', 'checkpoint_invalid')
+            if approval_batch_mode is not None and approval_batch_mode != saved_batch_mode:
+                raise OnlineError('恢复时不能改变批量同意分批策略', 'resume_mismatch')
+            self.approval_batch_mode = saved_batch_mode
         else:
             try:
                 self.query_scope = resolve_scope(date=date, all_pending=all_pending)
@@ -124,6 +138,8 @@ class BatchRunner:
                           'registry_path': self.registry['path'],
                           'registry_identity_sha256': selected_identity(self.registry, selected),
                           'selected_shop_ids': selected, 'plan_only': plan_only,
+                          'approve_applications': not plan_only,
+                          'approval_batch_mode': self.approval_batch_mode,
                           'node': node, 'node_modules': node_modules,
                           'shops': [{**available[sid], 'status': 'pending', 'attempts': [],
                                      'tax_rate_policy': policies[sid],
@@ -234,6 +250,8 @@ class BatchRunner:
                                   jst_browser_config=Path(self.registry['jst_browser_config']),
                                   node=self.node, node_modules=self.node_modules, plan_only=self.state['plan_only'],
                                   connect_only=self.connect_only, query_scope=dict(self.query_scope),
+                                  approve_applications=self.state.get('approve_applications', False),
+                                  approval_batch_mode=self.approval_batch_mode,
                                   tax_rate_policy=dict(shop['tax_rate_policy']))
                     if self.query_scope['mode'] == 'all_pending':
                         kwargs['all_pending'] = True

@@ -34,3 +34,5 @@ jobs:
           PYTHONUTF8: '1'
       - name: Page scripts with synthetic responses
         run: node scripts/test_read_collectors.mjs
+      - name: Application approval with synthetic responses
+        run: node scripts/test_approve_qianniu.mjs

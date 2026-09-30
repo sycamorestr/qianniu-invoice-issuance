@@ -60,6 +60,8 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 | --- | --- | --- |
 | 千牛申请 | `operation: applications`、单日或冻结的 `query_scope`、当前 `agentId` | 本次日期范围的全分页申请诊断快照 |
 | 千牛导出 | `operation: export`、同一日期范围、当前 `agentId` | 原始响应字节；非空须为 XLSX，零字节须与明确空列表联合核验 |
+| 千牛同意前后状态 | `operation: approval-status`、同一日期范围及身份、精确流水号和订单号 | 完整分页核对目标的待处理、待录入或未知状态 |
+| 千牛批量同意 | `operation: approve`、同一身份、全部入选流水号和字符串订单号（旧作业保留原分批） | 单次写请求的业务响应；后续须逐笔读回待录入状态 |
 | 千牛订单 | `operation: orders`、1–50 个字符串订单号、可选查询条件 | 完整分页、明细、明确缺失集合 |
 | 订单详情 | 当前字符串订单号 | 已核对订单号的 DOM/运行时明细 |
 | 票聚商品 | 1–40 个编码、当前 `coid` / `uid` | 保持输入顺序的逐编码查询结果 |
@@ -99,6 +101,8 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 自动金额证据保存在生成目录的 `derived_match_evidence.json`。来源必须说明订单、子订单、详情 URL/时间、原始价格单元格、数量及相同金额口径；列表 `realTotal` 不能自动升级为证据。可选 `match_evidence.json` 与推导证据冲突时停止。详细匹配约束见[详细规则](detailed-rules.md)。
 
 ## 原子发布和恢复
+
+新增批量同意独立于只读采集的重试机制：先完成原件导出与选择，冻结准确目标及源文件哈希，发送前持久化意图，成功响应后再只读核验进入“待录入开票”。网络超时或缺少明确回执不重发；恢复可只读确认全部已同意，否则 `approval_unknown` 停止。旧作业、旧批次及其未启动子店不自动增加同意；离线重放和 `--plan-only` 不写平台。接口详见[批量同意](page-integration.md#批量同意申请)。
 
 先获取输出目录作业锁，再连接浏览器并获取整个 `user_data_dir` 的文件锁。双浏览器按规范化数据目录排序连接，共享票聚锁一直持有到本店任务结束。锁由操作系统持有句柄，进程退出自动释放；锁文件存在不等于被占用，不能删除文件解锁。
 

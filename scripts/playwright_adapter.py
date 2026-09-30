@@ -56,6 +56,12 @@ def _controller_error_code(error: BrowserControllerError) -> str:
         "context_missing_store": "context_missing",
         "context_missing_agent_id": "context_missing",
         "context_missing_account": "context_missing",
+        "approval_identity_required": "context_missing",
+        "approval_role_unsupported": "approval_role_unsupported",
+        "approval_duplicate_check": "approval_duplicate_check",
+        "approval_unknown": "approval_unknown",
+        "approval_rejected": "approval_rejected",
+        "approval_target_conflict": "approval_target_conflict",
     }
     # Playwright appends a stack after its first line. Do not reinterpret a
     # quoted token, a longer token, or a token appearing only in that stack.
@@ -383,6 +389,43 @@ class PlaywrightAdapterRunner:
             if task is not None:
                 self._operation_tasks.discard(task)
 
+    async def _approval(self, operation: str, payload: dict[str, Any], binary: bool) -> dict[str, Any]:
+        """Pin the captured identity before any approval read or write."""
+        applications = payload.get("applications")
+        valid_text = lambda value: isinstance(value, str) and bool(value) and value.strip() == value
+        if (binary or not isinstance(applications, list)
+                or any(not isinstance(row, dict) or set(row) != {"serialNo", "tid"}
+                       or not valid_text(row.get("serialNo")) or not valid_text(row.get("tid"))
+                       for row in applications)
+                or len({row["serialNo"] for row in applications}) != len(applications)
+                or any(not valid_text(payload.get(name)) for name in (
+                    "expected_store", "expected_observed_store", "expected_account_nick"))
+                or "repeatCheck" in payload or "autoCreate" in payload):
+            raise PlaywrightAdapterError("批量同意缺少精确申请或原店铺身份", "configuration", site="qianniu")
+        controller = self._controller_for("qianniu")
+        # Existing workbench aliases are valid only with the exact saved login.
+        context_payload = {**payload, "expected_account": payload.get("expected_account")
+                           or payload["expected_account_nick"]}
+        await controller.evaluate_file("invoice", self.skill_dir / "playwright_context_qianniu.js", context_payload)
+        value = await controller.evaluate_file("invoice", self.skill_dir / "approve_qianniu.js", payload)
+        if (not isinstance(value, dict) or value.get("operation") != operation
+                or value.get("date") != payload.get("date")
+                or value.get("query_scope") != payload.get("query_scope")
+                or not isinstance(value.get("applications"), list)):
+            raise PlaywrightAdapterError("批量同意返回范围不一致", "response_invalid", site="qianniu")
+        expected = [(row["serialNo"], row["tid"]) for row in applications]
+        actual = value["applications"]
+        if (any(not isinstance(row, dict) for row in actual)
+                or [(row.get("serialNo"), row.get("tid")) for row in actual] != expected
+                or (operation == "approval-status" and (
+                    not valid_text(value.get("checked_at"))
+                    or any(row.get("status") not in {"pending", "agreed", "unknown"} for row in actual)))
+                or (operation == "approve" and (
+                    type(value.get("code")) is not int or value["code"] != 200
+                    or not isinstance(value.get("message"), str) or not valid_text(value.get("approved_at"))))):
+            raise PlaywrightAdapterError("批量同意返回申请或状态不一致", "response_invalid", site="qianniu")
+        return value
+
     async def _invoke_for_site(self, site: str, operation: str, payload: dict[str, Any],
                                binary: bool) -> Any:
         controller = self._controller_for(site)
@@ -392,6 +435,8 @@ class PlaywrightAdapterRunner:
         if site == "jst" and operation == "context":
             return await self._context_jst(payload)
         if site == "qianniu":
+            if operation in {"approval-status", "approve"}:
+                return await self._approval(operation, payload, binary)
             role = "orders" if operation in {"orders", "detail"} else "invoice"
             if operation == "orders":
                 requested_orders = self._validate_orders_request(payload)
@@ -450,7 +495,7 @@ class PlaywrightAdapterRunner:
         # Allow pacing/pagination and the two detail navigations without
         # consuming the old single-operation watchdog. Network/navigation
         # timeouts still apply and the overall operation remains bounded.
-        budget = {"orders": 120, "detail": 90}.get(operation) if site == "qianniu" else None
+        budget = {"orders": 120, "detail": 90, "approval-status": 120}.get(operation) if site == "qianniu" else None
         value = self._call(self._invoke_async(site, operation, payload, binary),
                            site=site, timeout_seconds=budget)
         if binary and isinstance(value, (bytes, bytearray)):

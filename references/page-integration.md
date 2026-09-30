@@ -60,6 +60,33 @@ GET https://einvoice.taobao.com/api/invoice/batch4visitor/apply
 
 税局空白模板来自 `assets/tax-bureau-template-V260401.xlsx`，日常无需重新下载。模板版本更换需单独核验字段、隐藏字典及数据区，不能把通用模板当税局模板。
 
+## 批量同意申请
+
+新在线任务在通用模板原件及 `selection.json` 固定后，增加批量同意步骤。目标仅为原件“待处理”与本次日期、倒计时“已开始”快照的交集，使用精确的 `serialNo` 和字符串 `tid`，一次提交全部入选申请。平台导出忽略倒计时的行为不变，不能直接按完整原件全部同意；也不能先同意再导出，或将原件状态改写为待处理。
+
+列表的 `pageSize=20` 只控制读取分页；前端同意函数将所选清单作为一个 `agreeList` 提交，没有发现 20 笔校验。新作业及新批次冻结 `approval_batch_mode="single_request"`；旧检查点没有此字段时仍按原 `legacy_20` 边界恢复，不能对已有发送意图重新拆合批。服务端最大接收笔数仍需以实测为准，不承诺任意规模；拒绝或结果不明时停止，不自动拆批重发。
+
+单店实测：当前筛选的 33 笔申请通过一个 `agreeList` 请求返回成功，33 笔均逐一读回为“待录入开票”。因此已验证单次超过 20 笔可行，尚未验证服务端最大容量。
+
+2026-09-30 真实点击千牛“搜索 → 全选 → 批量同意”确认接口为：
+
+```text
+POST https://einvoice.taobao.com/api/invoice/apply/agree
+Content-Type: application/json
+```
+
+```json
+{"agreeList":[{"serialNo":"本次申请流水号","tid":"本次字符串订单号"}],"repeatCheck":true}
+```
+
+页面返回 `{code:200,message:"操作成功"}` 后，申请由 `applyStatus=1` 进入“待录入开票”列表，状态为 `2`。`repeatCheck` 保持 `true`，重复开票提示（`code=1020`）或其他异常均停止，不模拟“继续开票”或取消重复检查。该写请求不采用采集请求的自动重试。
+
+当前访客模式按实测页面请求省略 `autoCreate`。其他已识别角色显式发送 `autoCreate:1`，对应页面选项“在【待录入开票列表】中手动上传发票”；`autoCreate:0` 对应“系统自动开票”，本流程禁止使用。角色不明时停止，不猜测默认行为。
+
+`approve_qianniu.js` 提供 `approval-status` 和 `approve`，适配器在每次操作前核对当前店铺与原采集账号。状态核对完整读取原日期范围内的待处理列表和 `/api/qianniu/invoice/list/apply/agreed` 列表：前者带 `rightsRemainTime=100`，后者不带倒计时，以免状态变化后漏掉已同意目标。只接受流水号及订单号完全对应的状态，未知、冲突或分页不完整不能当作已同意。
+
+发送前记录准确目标和发送意图，成功后保存响应并只读确认全部目标进入“待录入开票”。已有发送意图但没有可靠结果时，恢复只核对状态；全部已同意可确认完成，否则返回 `approval_unknown`，不自动重发。成功阶段恢复复用检查点，旧任务、旧批次、离线重放和 `--plan-only` 不执行新增写操作。原件、金额、负数排除、商品匹配和税率规则不因同意而变化。
+
 ## 千牛订单批量查询
 
 `read_qianniu.js` 的 `orders` 操作调用：

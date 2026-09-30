@@ -12,6 +12,8 @@
 
 申请列表用于完整性、订单关联及倒计时资格核对。服务端 `total` 可能是待处理计数，而分页数据仍可能夹带其他状态；分页总数必须稳定，流水号不能冲突或漏页。`applyStatus`（包括值为 `1`）只记录列表快照，不能替代通用模板状态。applications.json 的 rows 保留本次筛选下全部观察到的申请，list_non_pending_snapshot_rows 是其中非待处理状态的重叠诊断子集；api_total 是服务端 total，total/observed_total 是实际观察到的唯一流水号数。旧检查点的 excluded_non_pending_rows 仅作兼容读取，不再生成。
 
+新在线任务在原件与选择清单固定后，批量同意全部入选待处理申请；同意前后读取当前列表状态仅用于证明该写操作的条件及结果，不替代原件的生成资格、金额或字段。已同意申请可能随后因票聚资料不足而暂缓生成，或按原规则排除负金额；这些业务规则不改变。原件和筛选快照保持同意前的原始字节，恢复复用该快照。
+
 下载的通用模板是状态、数量和金额依据，必须具有“开票状态”或“申请状态”列，缺列是输入错误。每个源行优先读取“开票状态”，其值为空时才读取“申请状态”；仅值准确为“待处理”的源行有资格进入生成。started模式再与完整筛后快照的 serialNo 集合取交集，缺快照、计数不完整、范围不符或哈希变化即停止。selected_application_ids 按入选源行原序去重；非待处理行进入 ignored_template_rows，倒计时未入选的待处理行单独记录 filtered_out_countdown_rows，均不查订单、不进入税局模板。
 
 collection_files.py orders 写入 selection.json，绑定通用模板 SHA-256、源行数、状态分布、待处理源行数、流水号顺序和忽略状态；started模式额外保存 query_scope、applications_sha256、raw_pending_source_row_count、raw_pending_application_ids、filtered_out_countdown_application_ids 和 filtered_out_countdown_rows。倒计时未入选申请不计入 ready/blocked/excluded。订单、商品编码和票聚汇总检查点继承选择哈希；下游重新核对原件与筛选证据。原始通用模板始终字节不变，可能包含未入选申请。
