@@ -100,7 +100,11 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 
 自动金额证据保存在生成目录的 `derived_match_evidence.json`。来源必须说明订单、子订单、详情 URL/时间、原始价格单元格、数量及相同金额口径；列表 `realTotal` 不能自动升级为证据。可选 `match_evidence.json` 与推导证据冲突时停止。详细匹配约束见[详细规则](detailed-rules.md)。
 
+整组等价匹配独立于逐行唯一金额证据：`invoice_input.json` 的订单明细保存 `detail_gross_evidence`，绑定原始详情文档、检查点绝对路径及字节哈希；计划明细保存 `match_method="group_equivalence"` 和 `group_equivalence`，记录申请/订单、完整源行和子订单集合、相邻折扣、等价经济字段、稳定分配及证据摘要。原检查点必须仍可读取且哈希一致。独立复核重新验证完整组和分配；删除组标记与原始证据也不能使多候选被当作唯一匹配。逐行金额诊断仍可能记录多个候选，最终是否可生成以通过复核的计划为准。组级字段只用于本地审计，不新增税局工作簿列。
+
 ## 原子发布和恢复
+
+业务请求前按[页面就绪与统一节奏](page-integration.md#页面就绪与统一节奏)等待和限速。`page_not_ready` 保存等待超时原因；`verification_required` 明确要求人工验证并停止整批。取消会通知页面终止在途请求及后续分页/重试，待控制任务清理完成后才释放浏览器锁。审批发送意图之前的就绪/验证失败不会创建 intent；intent 之后的异常保持 `approval_unknown`，不得据错误码推断未发送。
 
 新增批量同意独立于只读采集的重试机制：先完成原件导出与选择，冻结准确目标及源文件哈希，发送前持久化意图，成功响应后再只读核验进入“待录入开票”。网络超时或缺少明确回执不重发；恢复可只读确认全部已同意，否则 `approval_unknown` 停止。旧作业、旧批次及其未启动子店不自动增加同意；离线重放和 `--plan-only` 不写平台。接口详见[批量同意](page-integration.md#批量同意申请)。
 
@@ -121,6 +125,8 @@ Node 与 Artifact Tool 的 `node_modules` 取当前 `load_workspace_dependencies
 ## 本地计划与工作簿
 
 `run_invoice.py` 先复制原始通用模板并核对哈希，然后组装 `invoice_input.json`，生成 `invoice_plan.json`、`derived_match_evidence.json` 和异常清单。逐票计划保留源行、订单项证据、折扣源行、原商品金额、价外费用金额及费用源行。
+
+最终税局工作簿的流水号按[字段映射](flow-and-field-mapping.md)投影，不改写计划中的平台申请号。`run_invoice.py --export-serial-source order_no|application_no` 默认 `order_no`；协调器显式传入作业/批次冻结的 `export_serial_source`，旧状态缺值时恢复为 `application_no`。生成目录的 `run.json` 保存该策略及 `invoice_serial_mapping`（申请号到输出流水号）；没有执行工作簿生成时映射为空。此字段不进入采集请求、申请集合或计划指纹。只在最终工作簿分支验证订单编号，不影响计划探测、详情补证或原业务暂缓判断。
 
 负数整票标为 `excluded_negative`，无输出明细；其他票按资料完整性判定可生成或暂缓。单独计划构建器的 `ready_for_export` 仅表示可生成文件，计划指纹不是提交去重或已开具登记。
 

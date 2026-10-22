@@ -2,6 +2,11 @@
   const input = __INPUT__;
   const {operation} = input;
   const timestamp = () => new Date().toISOString();
+  let stopRequested = false;
+  const activeControllers = new Set();
+  const stop = () => { stopRequested = true; for (const controller of activeControllers) controller.abort(); };
+  globalThis.addEventListener?.('qianniu-invoice-stop', stop);
+  try {
   if (!['approval-status', 'approve'].includes(operation)) throw Error('unknown_approval_operation');
   if (!['myseller.taobao.com', 'einvoice.taobao.com'].includes(location.hostname)) throw Error('wrong_invoice_page');
   const validText = value => typeof value === 'string' && value.length > 0 && value.trim() === value;
@@ -41,20 +46,61 @@
     throw Error('approval_identity_required');
   if (Object.hasOwn(input, 'repeatCheck') || Object.hasOwn(input, 'autoCreate'))
     throw Error('invalid_approval_options');
+  const REQUEST_INTERVAL_MS = 5000;
+  const verificationPattern = /_____tmd_____\/punish|FAIL_SYS_USER_VALIDATE|RGV587_ERROR|滑块验证|拖动滑块|请完成验证|安全验证|访问验证|验证码|访问受限|(?:访问|请求|操作|调用)过于频繁/i;
+  function challengeVisible() {
+    if (stopRequested || globalThis.__qianniuInvoiceStopRequested === true) { stopRequested = true; return true; }
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return false;
+    return [...document.querySelectorAll('iframe,.nc-container,[id^="nc_"][id$="_wrapper"],#baxia-dialog-content')].some(node => {
+      const rect = node.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = typeof getComputedStyle === 'function' ? getComputedStyle(node) : null;
+      if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+      return String(node.tagName || '').toLowerCase() !== 'iframe' ||
+        verificationPattern.test([node.src, node.title, node.getAttribute?.('src')].join(' '));
+    });
+  }
   async function request(url, options = {}, mutation = false) {
     // Never retry a mutation: a dropped response can follow a successful POST.
-    let response;
+    const controller = new AbortController();
+    activeControllers.add(controller);
+    let timer = null, interrupted = false, sent = false;
+    const guard = () => { if (challengeVisible()) { interrupted = true; controller.abort(); } };
+    guard();
+    const watcher = setInterval(guard, 500);
     try {
-      response = await fetch(url, {...options, credentials: 'include', signal: AbortSignal.timeout(30000)});
+      if (interrupted) throw Error('verification_required');
+      await new Promise(resolve => setTimeout(resolve, REQUEST_INTERVAL_MS));
+      guard(); if (interrupted) throw Error('verification_required');
+      timer = setTimeout(() => controller.abort(), 30000);
+      sent = true;
+      const response = await fetch(url, {...options, credentials: 'include', signal: controller.signal});
+      guard(); if (interrupted) throw Error('verification_required');
+      if (verificationPattern.test(String(response.url || ''))) throw Error('verification_required');
+      if (response.status === 401 || response.status === 403 || /login|passport/i.test(response.url)) throw Error('login_required');
+      if (response.status === 429) throw Error('rate_limited');
+      const content = await response.text();
+      guard(); if (interrupted) throw Error('verification_required');
+      let body; try { body = JSON.parse(content); } catch (_) {}
+      const html = /<(?:!doctype|html|head|body|script)[\s>]/i.test(content);
+      const diagnostic = body && typeof body === 'object' ?
+        [body.message, body.msg, body.error, body.errorMsg, body.ret, body.url, body.redirectUrl,
+          body.data?.url, body.data?.redirectUrl].filter(value => value != null).join(' ') : content;
+      if (verificationPattern.test(diagnostic) || (html && verificationPattern.test(content))) throw Error('verification_required');
+      if ((html && /login|passport|请先登录|重新登录/i.test(content)) ||
+          /未登录|登录失效|请先登录|请重新登录|登录超时|login required|session expired|token expired/i.test(diagnostic) ||
+          body?.isLogin === false || body?.isLogin === 0 || [401, 403].includes(Number(body?.code))) throw Error('login_required');
+      if (!response.ok) throw Error(`HTTP ${response.status}`);
+      if (body === undefined) throw Error('invalid_json_response');
+      return body;
     } catch (error) {
-      if (mutation) throw Error('approval_unknown');
+      guard();
+      // After dispatch even a login/verification response cannot prove that
+      // the POST had no effect. Recovery must only reconcile its saved targets.
+      if (mutation && sent) throw Error('approval_unknown' + (interrupted || error.message === 'verification_required' ? ': verification_required' : ''));
+      if (interrupted) throw Error('verification_required');
       throw error;
-    }
-    if (response.status === 401 || response.status === 403 || /login|passport/i.test(response.url)) throw Error('login_required');
-    if (response.status === 429) throw Error(mutation ? 'approval_unknown' : 'rate_limited');
-    if (!response.ok) throw Error(mutation ? 'approval_unknown' : `HTTP ${response.status}`);
-    try { return await response.json(); }
-    catch (error) { if (mutation) throw Error('approval_unknown'); throw error; }
+    } finally { if (timer !== null) clearTimeout(timer); clearInterval(watcher); controller.abort(); activeControllers.delete(controller); }
   }
   if (operation === 'approve') {
     if (!applications.length) return {...result, applications: [], code: 200, message: 'empty', approved_at: timestamp()};
@@ -132,4 +178,5 @@
     return {...target, status};
   });
   return {...result, applications: states, checked_at: timestamp()};
+  } finally { globalThis.removeEventListener?.('qianniu-invoice-stop', stop); }
 })()

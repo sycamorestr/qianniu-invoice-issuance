@@ -17,6 +17,8 @@ class ApprovalAdapter:
         self.timeout = False
         self.commit = True
         self.post_status = None
+        self.status_error = None
+        self.approve_error = None
 
     def __call__(self, site, operation, input_path, output_path):
         request = run_online.read_json(input_path)
@@ -24,11 +26,17 @@ class ApprovalAdapter:
         base = {"operation": operation, "date": request["date"],
                 "query_scope": request["query_scope"]}
         if operation == "approval-status":
+            if self.status_error:
+                raise run_online.OnlineError("simulated read preflight failure",
+                                             self.status_error, site="qianniu")
             return {"payload": {**base, "checked_at": "2026-09-30T00:00:00Z",
                     "applications": [{**row, "status": self.states.get(row["serialNo"], "pending")}
                                      for row in request["applications"]]}}
         if operation == "approve":
             assert (output_path.parent / (input_path.stem + ".intent.json")).is_file()
+            if self.approve_error:
+                raise run_online.OnlineError("simulated failure after durable intent",
+                                             self.approve_error, site="qianniu")
             if self.commit:
                 self.states.update({row["serialNo"]: self.post_status or "agreed"
                                     for row in request["applications"]})
@@ -174,6 +182,60 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(run_online.OnlineError):
             runner._approve_applications()
         self.assertEqual(self.writes(), [])
+
+    def test_read_preflight_failure_has_no_intent_and_resume_sends_once(self):
+        for code in ("verification_required", "page_not_ready"):
+            with self.subTest(code=code):
+                self.adapter = ApprovalAdapter()
+                runner = self.prepared(count=2)
+                approval_dir = runner.run_dir / "approval"
+                self.adapter.status_error = code
+                with self.assertRaises(run_online.OnlineError) as error:
+                    runner._approve_applications()
+                self.assertEqual(error.exception.code, code)
+                self.assertEqual(error.exception.site, "qianniu")
+                self.assertEqual([op for op, _ in self.adapter.calls], ["approval-status"])
+                self.assertEqual(list(approval_dir.glob("*.intent.json*")), [])
+                self.assertEqual(list(approval_dir.glob("*.complete.json*")), [])
+                self.assertEqual(self.writes(), [])
+
+                self.adapter.status_error = None
+                resumed = self.make_runner(resume=runner.run_dir)
+                resumed._approve_applications()
+                self.assertEqual([op for op, _ in self.adapter.calls],
+                                 ["approval-status", "approval-status", "approve", "approval-status"])
+                self.assertEqual(len(self.writes()), 1)
+                self.assertEqual(resumed.state["application_approval"]["agreed_count"], 2)
+                call_count = len(self.adapter.calls)
+                self.make_runner(resume=runner.run_dir)._approve_applications()
+                self.assertEqual(len(self.adapter.calls), call_count)
+
+    def test_verification_after_intent_stays_unknown_and_pending_never_reposts(self):
+        runner = self.prepared(count=2)
+        self.adapter.approve_error = "verification_required"
+        with self.assertRaises(run_online.OnlineError) as error:
+            runner._approve_applications()
+        self.assertEqual(error.exception.code, "approval_unknown")
+        self.assertEqual(error.exception.site, "qianniu")
+        self.assertEqual(error.exception.__cause__.code, "verification_required")
+        self.assertEqual([op for op, _ in self.adapter.calls], ["approval-status", "approve"])
+        intent_path = runner.run_dir / "approval/approval-001.intent.json"
+        intent_bytes = intent_path.read_bytes()
+        self.assertFalse((runner.run_dir / "approval/approval-001.complete.json").exists())
+        self.assertFalse((runner.run_dir / "approval/approval-001.response.json").exists())
+        self.assertEqual(self.adapter.states, {})
+
+        self.adapter.approve_error = None
+        for _ in range(2):
+            self.adapter.calls.clear()
+            resumed = self.make_runner(resume=runner.run_dir)
+            with self.assertRaises(run_online.OnlineError) as error:
+                resumed._approve_applications()
+            self.assertEqual(error.exception.code, "approval_unknown")
+            self.assertEqual([op for op, _ in self.adapter.calls], ["approval-status"])
+            self.assertEqual(self.writes(), [])
+            self.assertEqual(intent_path.read_bytes(), intent_bytes)
+            self.assertFalse((runner.run_dir / "approval/approval-001.complete.json").exists())
 
     def test_zero_selection_has_no_browser_write_or_status_call(self):
         runner = self.prepared(count=0)

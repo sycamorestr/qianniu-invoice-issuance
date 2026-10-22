@@ -148,6 +148,8 @@ class InvoiceScopePipelineTests(unittest.TestCase):
             self.assertEqual((manifest['selected_count'], manifest['ready_count'], manifest['blocked_count'], manifest['excluded_count']), (3, 2, 0, 1))
             self.assertEqual(manifest['ready_amount'], '30')
             self.assertEqual(manifest['excluded_amount'], '-5')
+            self.assertEqual(manifest['export_serial_source'], 'order_no')
+            self.assertEqual(manifest['invoice_serial_mapping'], {'A-1': 'O-A-1', 'A-2': 'O-A-2'})
             self.assertEqual(source['selection']['ignored_template_rows'][0]['serialNo'], 'A-ignored')
             self.assertEqual({item['order_no'] for item in source['order_items']}, {'O-A-1', 'O-A-2'})
             self.assertEqual((output / 'qianniu_common_all-pending.xlsx').read_bytes(), original)
@@ -157,7 +159,7 @@ class InvoiceScopePipelineTests(unittest.TestCase):
             for name in SHEETS[:2]:
                 meta = schema[name]
                 records = [row for rn, row in read_rows(tax, name) if rn > meta['header_row'] and any(row.values())]
-                self.assertEqual({row[meta['columns']['发票流水号']] for row in records}, {'A-1', 'A-2'})
+                self.assertEqual({row[meta['columns']['发票流水号']] for row in records}, {'O-A-1', 'O-A-2'})
             with ZipFile(tax) as archive:
                 meta = schema[SHEETS[1]]
                 data = ET.fromstring(archive.read(meta['path'])).find(Q('sheetData'))
@@ -338,7 +340,7 @@ class InvoiceScopePipelineTests(unittest.TestCase):
             for name in SHEETS[:2]:
                 meta = schema[name]
                 records = [row for rn, row in read_rows(tax, name) if rn > meta['header_row'] and any(row.values())]
-                self.assertEqual({row[meta['columns']['发票流水号']] for row in records}, {'A-1'})
+                self.assertEqual({row[meta['columns']['发票流水号']] for row in records}, {'O-A-1'})
 
     def test_countdown_rejects_missing_or_incomplete_filtered_list(self):
         for alteration in ('missing', 'missing_count', 'too_few', 'duplicate', 'wrong_scope'):

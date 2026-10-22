@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -33,6 +33,14 @@ from browser_lock import FileMutex, FileMutexBusy
 
 ROLE_NAMES = ("home", "invoice", "orders", "goods")
 SUPPORTED_SCHEMA = 1
+GOODS_READINESS_FRAME_URL = "https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index"
+BUSINESS_READY_POLL_SECONDS = 0.25
+BUSINESS_READY_STABLE_SECONDS = 2.0
+VERIFICATION_URL_RE = re.compile(r"/_____tmd_____/punish(?:[/?#]|$)", re.IGNORECASE)
+TRANSIENT_PAGE_CONTEXT_ERRORS = (
+    "execution context was destroyed", "cannot find context", "frame was detached",
+    "most likely because of a navigation",
+)
 LOGIN_URL_RE = re.compile(
     r"(?:^|[/?#._-])(login|signin|sign-in|passport|account/login|member/login)"
     r"(?:[/?#._-]|$)",
@@ -983,6 +991,181 @@ class PlaywrightBrowserController:
             )
         return registration.page
 
+    def _ready_page(self, role: str) -> Any:
+        if self.browser is not None and self.browser.is_connected() is False:
+            raise BrowserControllerError("浏览器连接已断开", "browser_disconnected", details={"role": role})
+        page = self.page(role)
+        if _url_is_login(str(page.url or "")):
+            raise BrowserControllerError(
+                f"业务页面需要人工登录: {role}", "login_required", details={"role": role})
+        if VERIFICATION_URL_RE.search(str(page.url or "")):
+            raise BrowserControllerError(
+                f"业务页面出现验证，请在原浏览器完成人工验证后恢复: {role}",
+                "verification_required", details={"role": role, "signals": ["challenge_url"]})
+        return page
+
+    @staticmethod
+    def _check_probe(role: str, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise BrowserControllerError(
+                f"业务页面尚未就绪: {role}", "page_not_ready", details={"role": role})
+        if value.get("verification"):
+            raise BrowserControllerError(
+                f"业务页面出现验证，请在原浏览器完成人工验证后恢复: {role}",
+                "verification_required",
+                details={"role": role, "signals": value["verification"]})
+        if value.get("login_required"):
+            raise BrowserControllerError(
+                f"业务页面需要人工登录: {role}", "login_required", details={"role": role})
+        if value.get("ambiguous_context"):
+            raise BrowserControllerError(
+                f"业务页面包含多个租户身份，请确认原浏览器主体后恢复: {role}",
+                "context_changed", details={"role": role, "signals": ["ambiguous_tenant"]})
+        return value
+
+    def _probe_error(self, role: str, error: Exception) -> BrowserControllerError:
+        # Keep disconnect/closed-page failures actionable instead of retrying
+        # them as loading. Never create another page in this path.
+        try:
+            self._ready_page(role)
+        except BrowserControllerError as classified:
+            return classified
+        headline = str(error).lower()
+        if "browser has been closed" in headline or "browser disconnected" in headline:
+            return BrowserControllerError("浏览器连接已断开", "browser_disconnected", details={"role": role})
+        if "page has been closed" in headline or "target closed" in headline:
+            return BrowserControllerError(f"业务页面缺失: {role}", "page_missing", details={"role": role})
+        return BrowserControllerError(
+            f"业务页面尚未就绪: {role}", "page_not_ready", details={"role": role})
+
+    async def _visible_challenge_frames(self, role: str, page: Any) -> None:
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            current = str(frame.url or "")
+            challenge = bool(VERIFICATION_URL_RE.search(current))
+            login = (_url_is_login(current) and _same_site_family(current, self.specs[role].url))
+            if not challenge and not login:
+                continue
+            element = await frame.frame_element()
+            if await element.is_visible():
+                if login:
+                    raise BrowserControllerError(
+                        f"业务页面需要人工登录: {role}", "login_required", details={"role": role})
+                raise BrowserControllerError(
+                    f"业务页面出现验证，请在原浏览器完成人工验证后恢复: {role}",
+                    "verification_required", details={"role": role, "signals": ["challenge_iframe"]})
+
+    async def raise_if_verification_required(self, role: str) -> None:
+        """Read visible challenge evidence once; do not send a business request."""
+        page = self._ready_page(role)
+        source = Path(__file__).with_name("playwright_page_probe.js").read_text(encoding="utf-8")
+
+        async def probe() -> None:
+            await self._visible_challenge_frames(role, page)
+            self._check_probe(role, await page.evaluate(source, {}))
+
+        try:
+            await asyncio.wait_for(probe(), timeout=max(0.001, min(3.0, self.timeout_ms / 1000)))
+        except BrowserControllerError:
+            raise
+        except Exception as exc:
+            classified = self._probe_error(role, exc)
+            if (classified.code == "page_not_ready" and
+                    any(token in str(exc).lower() for token in TRANSIENT_PAGE_CONTEXT_ERRORS)):
+                # This one-shot monitor can race a normal detail navigation.
+                # Its old execution context is gone; the next poll inspects
+                # the new document. Closed pages/login/disconnects above are
+                # still terminal and visible challenge frames were checked
+                # before DOM evaluation began.
+                return
+            raise classified from exc
+
+    async def wait_for_business_ready(self, role: str, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        """Wait on natural DOM/resource evidence, without fetch/reload/new pages.
+
+        A document load event alone does not prove that the invoice app or
+        goods iframe has loaded its tenant. Poll only local page evidence;
+        login/verification/disconnection interrupts the wait immediately.
+        """
+        limit_ms = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        deadline = time.monotonic() + max(0.001, limit_ms / 1000)
+        source = Path(__file__).with_name("playwright_page_probe.js").read_text(encoding="utf-8")
+        signals: list[str] = []
+        stable_since: float | None = None
+        stable_token: tuple[str, ...] | None = None
+        while True:
+            page = self._ready_page(role)
+
+            async def probe() -> bool:
+                nonlocal signals, stable_since, stable_token
+                await self._visible_challenge_frames(role, page)
+                value = self._check_probe(role, await page.evaluate(source, {"role": role}))
+                signals = list(value.get("signals") or [])
+                current = str(page.url or "")
+                if _url_is_login(current):
+                    self._ready_page(role)
+                if not _same_role_page(current, self.specs[role].url):
+                    if current in {"", "about:blank"}:
+                        return False
+                    raise BrowserControllerError(
+                        f"业务页面已离开预期页面: {role}", "page_missing", details={"role": role})
+                if not value.get("ready"):
+                    return False
+                identity = [str(value.get("stable_token") or "")]
+                if role == "goods":
+                    frames = [frame for frame in page.frames if frame is not page.main_frame
+                              and GOODS_READINESS_FRAME_URL in str(frame.url or "")]
+                    if len(frames) != 1:
+                        return False
+                    frame = frames[0]
+                    if _url_is_login(str(frame.url or "")):
+                        raise BrowserControllerError(
+                            "票聚商品页面需要人工登录", "login_required", details={"role": role})
+                    value = self._check_probe(role, await frame.evaluate(
+                        source, {"role": role, "tenant_frame": True}))
+                    signals.extend(value.get("signals") or [])
+                    if not value.get("ready"):
+                        return False
+                    identity.append(str(value.get("stable_token") or ""))
+                    signals.append("goods_iframe")
+                observed_token = (current, *identity)
+                if observed_token != stable_token:
+                    stable_token = observed_token
+                    stable_since = time.monotonic()
+                return True
+
+            remaining = deadline - time.monotonic()
+            try:
+                if await asyncio.wait_for(probe(), timeout=max(0.001, remaining)):
+                    if stable_since is not None and time.monotonic() - stable_since >= BUSINESS_READY_STABLE_SECONDS:
+                        return {"ready": True, "role": role, "signals": signals}
+                else:
+                    stable_token = None
+                    stable_since = None
+            except BrowserControllerError as exc:
+                if exc.code != "page_not_ready":
+                    raise
+                stable_token = None
+                stable_since = None
+            except Exception as exc:
+                stable_token = None
+                stable_since = None
+                classified = self._probe_error(role, exc)
+                if classified.code != "page_not_ready":
+                    raise classified from exc
+                # Navigation can replace an execution context while a SPA
+                # loads. Only wait for it; never reload or replay a request.
+                if not isinstance(exc, TimeoutError) and not any(
+                        token in str(exc).lower() for token in TRANSIENT_PAGE_CONTEXT_ERRORS):
+                    raise classified from exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrowserControllerError(
+                    f"业务页面加载未在等待时限内完成: {role}", "page_not_ready",
+                    details={"role": role, "signals": signals, "timeout_ms": limit_ms}, retryable=True)
+            await asyncio.sleep(min(BUSINESS_READY_POLL_SECONDS, remaining))
+
     async def check_login(self, role: str) -> dict[str, Any]:
         page = self.page(role)
         spec = self.specs[role]
@@ -1050,6 +1233,8 @@ class PlaywrightBrowserController:
         input_value: Any = None,
         *,
         frame_url: str | None = None,
+        reset_stop: bool = False,
+        on_target: Callable[[Any], None] | None = None,
     ) -> Any:
         """Evaluate one of the skill's page scripts in a managed page/frame.
 
@@ -1110,6 +1295,18 @@ class PlaywrightBrowserController:
                 # causes the ``... is not a function`` failure seen in the JST
                 # context probe.
                 expression = source
+            if reset_stop:
+                # Reset only the context that will run this script, in the
+                # same evaluation; a newly loaded iframe cannot inherit a
+                # stale cancellation marker between separate evaluations.
+                expression = (
+                    "(() => { globalThis.__qianniuInvoiceStopRequested = false; return (\n"
+                    + expression.rstrip().rstrip(";") + "\n); })()"
+                )
+            if on_target is not None:
+                # Retain this actual Frame before dispatch. A later URL change
+                # must not prevent the adapter from signalling its old work.
+                on_target(target)
             return await target.evaluate(expression)
         except BrowserControllerError:
             raise

@@ -17,9 +17,11 @@ from zipfile import ZipFile
 import build_invoice_plan as rules
 from invoice_scope import make_scope, resolve_scope, scope_from_record, scope_label, scope_fields, scope_date_range
 from invoice_tax_policy import normalize_policy, resolve_tax_rate_policy
-from order_evidence import merge_order_details, derive_amount_evidence, attach_amount_evidence
+from order_evidence import (merge_order_details, derive_amount_evidence, attach_amount_evidence,
+                            attach_detail_gross_evidence, equivalent_group_assignments)
 from template_io import (BASIC, DETAIL, SHEETS, inspect_template, make_output_rows,
-                         is_ready_for_export, prepare, finalize, read_rows, require, sheet_paths, Q, ET)
+                         is_ready_for_export, validate_serial_mapping,
+                         prepare, finalize, read_rows, require, sheet_paths, Q, ET)
 
 HERE=Path(__file__).resolve().parent
 DEFAULT_TEMPLATE=HERE.parent/'assets'/'tax-bureau-template-V260401.xlsx'
@@ -344,6 +346,7 @@ def assemble(args, common_template=None):
     derived_evidence,evidence_diagnostics=derive_amount_evidence(detail_evidence,active_pending_rows)
     evidence=load(root/'match_evidence.json') if (root/'match_evidence.json').exists() else []
     attach_amount_evidence(normalized,[*evidence,*derived_evidence])
+    attach_detail_gross_evidence(normalized,detail_evidence,root)
     codes={i['goods_code'] for i in normalized if i['goods_code']}
     jst=load(root/'jst_query.json') if codes or (root/'jst_query.json').exists() else {'data':[]}
     validate_selection_binding(jst,selection,selection_path,'票聚批次')
@@ -434,10 +437,34 @@ def verify_sources(source,plan):
         require(invoice['basic']['show_buyer_contact'] is None and invoice['basic']['tax_included']=='是','基本信息固定值不正确')
         positives=[r['__source_row'] for r in selected_rows if amounts[r['__source_row']]>0 and r['__source_row'] not in fee_rows]
         require(positives==[l['source_row'] for l in invoice['detail_lines']],'正商品源行覆盖不完整')
+        # Rebuild from raw source evidence, independently of planner claims.
+        equivalent_groups=equivalent_group_assignments(
+            [(r['__source_row'],r) for r in selected_rows],source['order_items'])
+        independent_items=rules.make_order_items_index(source['order_items'])
+        independent_goods=rules.make_order_goods_index(source['order_items'])
+        independent_match=rules.InvoiceBuild(serial,[(r['__source_row'],r) for r in selected_rows])
+        independent_match.equivalent_groups=equivalent_groups
         for line in invoice['detail_lines']:
             row=raw[line['source_row']]; evidence=line.get('order_item_evidence')
             require(evidence is not None,'缺少子订单匹配证据')
             require(evidence in source['order_items'],'订单证据不在本次采集集合')
+            expected_group=equivalent_groups.get(line['source_row'])
+            claimed_group=line.get('match_method')=='group_equivalence' or 'group_equivalence' in line
+            if claimed_group or expected_group is not None:
+                require(expected_group is not None and line.get('match_method')=='group_equivalence',
+                        '整组等价匹配缺少有效原始证据或匹配方式')
+                require(line.get('group_equivalence')==expected_group['proof'],
+                        '整组等价匹配证明与独立核验不一致')
+                require(evidence==expected_group['item'], '整组等价匹配分配与独立核验不一致')
+            # Re-run the original unique-match sequence as well. Removing both
+            # group metadata and raw proof must not turn a selected candidate
+            # into an apparently valid singleton; preceding verified uses are
+            # retained so legacy unique-after-consumption matches still work.
+            independent_code=rules.resolve_goods_code(row,independent_goods,independent_match,
+                                                      line['source_row'],independent_items)
+            require(not independent_match.errors and independent_code==line['goods_code']
+                    and independent_match.matched_items.get(line['source_row'])==evidence,
+                    '商品匹配无法通过独立唯一性或整组等价核验')
             require(evidence['evidence_id'] not in used,'同一申请重复使用订单明细')
             used.add(evidence['evidence_id'])
             require(evidence['order_no']==row['订单编号'] and evidence['goods_code']==line['goods_code'],'订单商品关联错误')
@@ -539,6 +566,32 @@ def verify_sources(source,plan):
         require(source_totals=={total},'源表申请总金额与明细合计不一致')
     return ready
 
+def order_serial_mapping(source, plan):
+    """Project ready application keys to source order text for this workbook only."""
+    grouped = defaultdict(list)
+    for row in source['template_rows']:
+        grouped[row.get('申请流水号')].append(row)
+    mapping = {}
+    for invoice in plan['invoices']:
+        if not is_ready_for_export(invoice) or Decimal(invoice['invoice_total_amount']) < 0:
+            continue
+        application = invoice['invoice_serial_no']
+        rows = grouped.get(application, [])
+        require(rows, f'申请 {application} 缺少原始行，无法确定输出订单编号')
+        orders = set()
+        for row in rows:
+            order = row.get('订单编号')
+            require(isinstance(order, str) and order.strip(),
+                    f'申请 {application} 的订单编号缺失或不是文本，无法生成发票流水号')
+            order = order.strip()
+            require(len(order) <= 20, f'申请 {application} 的订单编号超过20位，无法生成发票流水号')
+            orders.add(order)
+        require(len(orders) == 1, f'申请 {application} 对应多个订单，无法确定唯一发票流水号')
+        mapping[application] = next(iter(orders))
+    validate_serial_mapping(mapping.keys(), mapping)
+    return mapping
+
+
 def verify_workbook(template,output,schema,expected):
     for name,meta in schema.items():
         rows=[values for rn,values in read_rows(output,name) if rn>meta['header_row'] and any(values.values())]
@@ -576,11 +629,14 @@ def main():
     p.add_argument('--node',type=Path);p.add_argument('--node-modules',type=Path)
     p.add_argument('--plan-only',action='store_true')
     p.add_argument('--replay',action='store_true',help='离线重放历史快照，不声明当前页面状态')
+    p.add_argument('--export-serial-source', choices=('order_no', 'application_no'), default='order_no',
+                   help='税局模板流水号来源；新作业默认订单编号，旧作业恢复沿用冻结值')
     args=p.parse_args()
     label='all-pending' if args.all_pending else scope_label(make_scope(args.date))
     args.output_dir.mkdir(parents=True,exist_ok=False)
     manifest={'date':args.date,'store':args.store,'issuer':args.issuer,'started_at':datetime.now(timezone.utc).isoformat(),
-              'stage':'inputs','status':'running','replay':args.replay,'inputs':{}}
+              'stage':'inputs','status':'running','replay':args.replay,'inputs':{},
+              'export_serial_source':args.export_serial_source,'invoice_serial_mapping':{}}
     try:
         # Publish the browser-exported original before any downstream input or
         # template check so even a failed build remains manually reconcilable.
@@ -624,7 +680,10 @@ def main():
                                 else 'all_excluded' if len(excluded)==len(plan['invoices']) else 'all_blocked')
         else:
             require(args.node and args.node_modules,'生成表格需传入 bundled --node 和 --node-modules')
-            schema=inspect_template(args.template);expected=make_output_rows(plan)
+            serial_mapping = order_serial_mapping(source, plan) if args.export_serial_source == 'order_no' else None
+            manifest['invoice_serial_mapping'] = (serial_mapping if serial_mapping is not None
+                                                  else {i['invoice_serial_no']: i['invoice_serial_no'] for i in ready})
+            schema=inspect_template(args.template);expected=make_output_rows(plan, serial_mapping)
             save(args.output_dir/'payload.json',{'schema':schema,'rows':expected})
             light=args.output_dir/'authoring-template.xlsx';authored=args.output_dir/'authored.xlsx'
             prepare(args.template,light,schema)

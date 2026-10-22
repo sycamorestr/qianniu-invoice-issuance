@@ -21,7 +21,7 @@ class PlaywrightApprovalTests(unittest.TestCase):
         }
         self.receipt = {key: deepcopy(self.payload[key]) for key in ("operation", "date", "query_scope", "applications")}
         self.receipt.update(code=200, message="操作成功", approved_at="2026-09-30T00:00:00Z")
-        self.controller = Mock(evaluate_file=AsyncMock(side_effect=[{"isLogin": True}, self.receipt]))
+        self.controller = Mock(wait_for_business_ready=AsyncMock(), evaluate_file=AsyncMock(side_effect=[{"isLogin": True}, self.receipt]))
         self.runner = object.__new__(PlaywrightAdapterRunner)
         self.runner.skill_dir = Path(__file__).resolve().parent
         self.runner.controllers = {"qianniu": self.controller}

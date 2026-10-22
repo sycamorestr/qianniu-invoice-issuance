@@ -17,12 +17,12 @@ from invoice_scope import resolve_scope, scope_fields, scope_from_record, scope_
 from invoice_tax_policy import load_tax_rate_config, policy_for_store
 from run_online import (OnlineRunner, OnlineError, replace_checkpoint, file_sha256, read_json,
                         utc_now, stable_sha256, finalize_delivery, frozen_tax_rate_policy,
-                        APPROVAL_BATCH_MODES)
+                        frozen_export_serial_source, APPROVAL_BATCH_MODES)
 from shop_registry import load_registry
 
 SUCCESS = {'complete', 'no_applications', 'all_excluded', 'all_blocked', 'plan_only'}
 SHOP_FAILURES = {'auth_required', 'login_required', 'permission_required', 'context_changed', 'context_mismatch',
-                 'context_missing', 'page_missing', 'browser_disconnected', 'profile_locked',
+                 'context_missing', 'page_missing', 'page_not_ready', 'browser_disconnected', 'profile_locked',
                  'browser_launch_failed', 'browser_identity_unverified'}
 
 
@@ -56,6 +56,7 @@ class BatchRunner:
                  plan_only: bool = False, connect_only: bool = False, all_pending: bool = False,
                  tax_rate_config: Path | None = None,
                  approval_batch_mode: str | None = None,
+                 export_serial_source: str | None = None,
                  runner_factory=OnlineRunner):
         self.registry = load_registry(registry)
         self.node, self.node_modules = node, node_modules
@@ -74,6 +75,7 @@ class BatchRunner:
         if resume:
             self.run_dir = resume.resolve()
             self.state = read_json(self.run_dir / 'batch-state.json')
+            self.export_serial_source = frozen_export_serial_source(export_serial_source, self.state)
             try:
                 self.query_scope = resolve_scope(date=date, all_pending=all_pending, saved=self.state)
             except ValueError as exc:
@@ -121,6 +123,7 @@ class BatchRunner:
                 raise OnlineError('恢复时不能改变批量同意分批策略', 'resume_mismatch')
             self.approval_batch_mode = saved_batch_mode
         else:
+            self.export_serial_source = frozen_export_serial_source(export_serial_source)
             try:
                 self.query_scope = resolve_scope(date=date, all_pending=all_pending)
             except ValueError as exc:
@@ -140,6 +143,7 @@ class BatchRunner:
                           'selected_shop_ids': selected, 'plan_only': plan_only,
                           'approve_applications': not plan_only,
                           'approval_batch_mode': self.approval_batch_mode,
+                          'export_serial_source': self.export_serial_source,
                           'node': node, 'node_modules': node_modules,
                           'shops': [{**available[sid], 'status': 'pending', 'attempts': [],
                                      'tax_rate_policy': policies[sid],
@@ -252,6 +256,7 @@ class BatchRunner:
                                   connect_only=self.connect_only, query_scope=dict(self.query_scope),
                                   approve_applications=self.state.get('approve_applications', False),
                                   approval_batch_mode=self.approval_batch_mode,
+                                  export_serial_source=self.export_serial_source,
                                   tax_rate_policy=dict(shop['tax_rate_policy']))
                     if self.query_scope['mode'] == 'all_pending':
                         kwargs['all_pending'] = True
@@ -281,7 +286,11 @@ class BatchRunner:
                     code, site = getattr(exc, 'code', 'failed'), getattr(exc, 'site', None)
                     shop.update(status='failed', error_code=code, error_site=site, error=str(exc))
                     shop['recovery_action'] = (
-                        '订单查询被平台限流，整批已停止；稍后确认原浏览器无验证拦截，再恢复此批次' if site == 'qianniu' and code == 'rate_limited' else
+                        '在此店铺原浏览器完成人工验证码后恢复原批次；整批已停止，已同意申请不重复提交' if site == 'qianniu' and code == 'verification_required' else
+                        '在共享票聚原浏览器完成人工验证码后恢复原批次；整批已停止' if site == 'jst' and code == 'verification_required' else
+                        '先在原浏览器处理验证码，再恢复原批次仅核对同意结果，不能重复提交' if code == 'approval_unknown' and 'verification_required' in str(exc) else
+                        '业务页面在等待期限内未就绪；检查原页面加载状态后恢复此批次' if code == 'page_not_ready' else
+                        '千牛请求被平台限流，整批已停止；稍后确认原浏览器无验证拦截，再恢复此批次' if site == 'qianniu' and code == 'rate_limited' else
                         '由主账号为此子账号分配发票列表查看权限后恢复此批次' if site == 'qianniu' and code == 'permission_required' else
                         '在共享票聚窗口完成人工登录后恢复此批次' if site == 'jst' and code in {'auth_required', 'login_required'} else
                         '在此店铺原浏览器窗口完成人工登录后恢复此批次' if site == 'qianniu' and code in {'auth_required', 'login_required'} else

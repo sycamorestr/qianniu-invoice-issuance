@@ -372,6 +372,27 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(resumed_jobs.calls), 8)
         self.assertNotIn('Test shop 1', [call['store'] for call in resumed_jobs.calls])
 
+    def test_verification_stops_all_shops_and_resume_skips_completed(self):
+        class ChallengeJobs(Jobs):
+            def run(self):
+                if self.kwargs['store'] == 'Test shop 2':
+                    root = self.kwargs.get('run_dir') or self.kwargs['resume']
+                    write(root / 'run-state.json', {'status': 'failed'})
+                    raise OnlineError('滑块验证码', 'verification_required', site='qianniu')
+                return super().run()
+
+        jobs = ChallengeJobs()
+        batch = self.batch(jobs)
+        result = batch.run()
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual([call['store'] for call in jobs.calls], ['Test shop 1', 'Test shop 2'])
+        self.assertEqual(result['shops'][2]['status'], 'pending')
+        self.assertIn('验证码', result['shops'][1]['recovery_action'])
+        followup = Jobs()
+        result = self.batch(followup, resume=batch.run_dir).run()
+        self.assertEqual(result['status'], 'complete')
+        self.assertNotIn('Test shop 1', [call['store'] for call in followup.calls])
+
     def test_shared_failure_stops_once_then_resumes_remaining_shops(self):
         jobs = Jobs({'Test shop 2': 'jst'})
         batch = self.batch(jobs)

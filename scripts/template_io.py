@@ -139,20 +139,37 @@ def is_ready_for_export(invoice):
     """Explicit lifecycle status wins; status-less historical plans stay readable."""
     return not invoice['errors'] and invoice.get('status','ready_for_export')=='ready_for_export'
 
-def make_output_rows(plan):
+def validate_serial_mapping(application_ids, serial_mapping):
+    """Validate a per-workbook projection without changing application identity."""
+    require(isinstance(serial_mapping, dict), '输出流水号映射必须为对象')
+    require(set(serial_mapping) == set(application_ids), '输出流水号映射与可导出申请集合不一致')
+    values = list(serial_mapping.values())
+    require(all(isinstance(value, str) and value and value == value.strip() and len(value) <= 20
+                for value in values), '输出流水号必须为非空文本且不超过20位')
+    require(len(values) == len(set(values)), '本次不同申请的订单编号重复，不能生成相同发票流水号')
+
+
+def make_output_rows(plan, serial_mapping=None):
     require(not plan.get('fatal') and not plan.get('errors'), '全局数据错误，不能生成表格')
     ready=[i for i in plan['invoices'] if is_ready_for_export(i)]
     require(set(plan['selected_application_ids'])=={i['invoice_serial_no'] for i in plan['invoices']},'申请集合不完整')
+    if serial_mapping is not None:
+        validate_serial_mapping([i['invoice_serial_no'] for i in ready
+                                 if Decimal(i['invoice_total_amount']) >= 0], serial_mapping)
     basic=[];details=[]
     for invoice in ready:
         amount=Decimal(invoice['invoice_total_amount'])
         require(amount.is_finite(),'申请总金额无效，不能生成表格')
         if amount<0:
             continue
-        b={**invoice['basic'],'invoice_serial_no':invoice['invoice_serial_no'],'show_buyer_contact':None}
+        serial = (serial_mapping[invoice['invoice_serial_no']] if serial_mapping is not None
+                  else invoice['invoice_serial_no'])
+        b={**invoice['basic'],'invoice_serial_no':serial,'show_buyer_contact':None}
         basic.append({label:b.get(field) or '' for label,field in BASIC.items()})
         for line in invoice['detail_lines']:
             row={label:'' if line.get(field) is None else line[field] for label,field in DETAIL.items()}
+            if serial_mapping is not None:
+                row['发票流水号'] = serial
             row['单价']=''
             if row['折扣金额']=='0':row['折扣金额']=''
             details.append(row)

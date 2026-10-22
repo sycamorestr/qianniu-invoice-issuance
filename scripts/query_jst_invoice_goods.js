@@ -26,6 +26,7 @@ async function (element, input) {
   var results = new Array(codes.length);
   var cursor = 0;
   var authError = null;
+  var stopError = null;
   var activeControllers = [];
   var retryCountTotal = 0;
 
@@ -64,6 +65,17 @@ async function (element, input) {
       try { controller.abort(); } catch (e) {}
     });
   }
+  // The controller dispatches this event in the goods iframe itself. Latch
+  // cancellation locally: clearing the shared flag for a later invocation
+  // cannot restart this worker pool or its read retries.
+  function requestStop() {
+    if (!stopError) stopError = errorWith("verification_required", "verification_required");
+    abortActiveRequests();
+  }
+  function checkStop() {
+    if (globalThis.__qianniuInvoiceStopRequested === true) requestStop();
+    if (stopError) throw stopError;
+  }
   function markAuth(details) {
     var error = errorWith("auth_required", "auth_required", details);
     if (!authError) {
@@ -79,10 +91,12 @@ async function (element, input) {
     var timer = null;
     if (controller) activeControllers.push(controller);
     try {
+      checkStop();
       if (controller) timer = setTimeout(function () { controller.abort(); }, timeoutMs);
       var options = { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
       if (controller) options.signal = controller.signal;
       var response = await fetch(endpoint, options);
+      checkStop();
       // Reject explicit auth responses before waiting for their response body.
       var authReason = authFailure(response, "", null);
       if (authReason) {
@@ -92,6 +106,7 @@ async function (element, input) {
       // Keep both the timeout and cancellation controller alive until the body
       // is consumed; fetch resolves as soon as response headers arrive.
       var content = await response.text();
+      checkStop();
       return { response: response, content: content };
     } finally {
       if (timer !== null) clearTimeout(timer);
@@ -110,6 +125,7 @@ async function (element, input) {
     var retries = 0;
     var lastFailure = null;
     while (attempts <= maxRetries) {
+      checkStop();
       if (authError) throw authError;
       attempts += 1;
       var response = null;
@@ -145,6 +161,7 @@ async function (element, input) {
         var matchBasis = unique && exactMatches.length === 1 ? "sku_id_exact" : unique ? "sku_id_paren_width" : null;
         return { input_goods_code: code, ok: unique, match_basis: matchBasis, reason: unique ? null : matches.length ? "multiple_exact_matches" : "no_exact_match", rows: rows, exact_matches: unique ? matches : [], attempts: attempts, retry_count: retries };
       } catch (error) {
+        checkStop();
         if (error && error.code === "auth_required") throw error;
         // Another worker may have detected a logged-out response while this
         // request was in flight. Do not retry or start another request then.
@@ -162,13 +179,14 @@ async function (element, input) {
   }
 
   async function worker() {
-    while (!authError) {
+    while (!authError && !stopError) {
       var index = cursor;
       cursor += 1;
       if (index >= codes.length) return;
       try {
         results[index] = await queryOne(codes[index]);
       } catch (error) {
+        if (stopError) return;
         if (error && error.code === "auth_required") {
           authError = authError || error;
           abortActiveRequests();
@@ -179,12 +197,19 @@ async function (element, input) {
     }
   }
 
-  var workers = [];
-  for (var workerIndex = 0; workerIndex < Math.min(concurrency, codes.length); workerIndex += 1) workers.push(worker());
-  await Promise.all(workers);
-  if (authError) throw authError;
-  var failures = results.filter(function (x) { return !x || !x.ok; });
-  // Top-level status describes completed collection, not match success. Keep
-  // successful rows and per-code failures in one resumable checkpoint.
-  return { ok: true, blocked: false, partial: !!failures.length, has_failures: !!failures.length, all_matched: !failures.length, href: location.href, queried_at: new Date().toISOString(), requested_count: codes.length, mapped_count: codes.length - failures.length, concurrency: concurrency, max_retries: maxRetries, retry_count: retryCountTotal, failures: failures, data: results };
+  globalThis.addEventListener?.('qianniu-invoice-stop', requestStop);
+  try {
+    checkStop();
+    var workers = [];
+    for (var workerIndex = 0; workerIndex < Math.min(concurrency, codes.length); workerIndex += 1) workers.push(worker());
+    await Promise.all(workers);
+    checkStop();
+    if (authError) throw authError;
+    var failures = results.filter(function (x) { return !x || !x.ok; });
+    // Top-level status describes completed collection, not match success. Keep
+    // successful rows and per-code failures in one resumable checkpoint.
+    return { ok: true, blocked: false, partial: !!failures.length, has_failures: !!failures.length, all_matched: !failures.length, href: location.href, queried_at: new Date().toISOString(), requested_count: codes.length, mapped_count: codes.length - failures.length, concurrency: concurrency, max_retries: maxRetries, retry_count: retryCountTotal, failures: failures, data: results };
+  } finally {
+    globalThis.removeEventListener?.('qianniu-invoice-stop', requestStop);
+  }
 }

@@ -29,13 +29,50 @@ def text(raw):
     return None if value and '[objectobject]' in value else value
 
 
+def named_specification_pairs(raw):
+    """Recognize complete, uniquely named attributes without guessing delimiters."""
+    if isinstance(raw, str):
+        parts = [part for part in raw.splitlines() if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        parts = raw
+    else:
+        return None
+    pairs = []
+    names = set()
+    for part in parts:
+        if isinstance(part, dict):
+            name = part.get('name') or part.get('label')
+            value = part.get('value')
+            if not isinstance(name, str) or not isinstance(value, str):
+                return None
+        elif isinstance(part, str):
+            fields = re.split(r'[:：]', part)
+            if len(fields) != 2:
+                return None
+            name, value = fields
+        else:
+            return None
+        if re.search(r'[:：\r\n]', name) or re.search(r'[:：\r\n]', value):
+            return None
+        name, value = text(name), text(value)
+        if not name or not value or name in names:
+            return None
+        names.add(name)
+        pairs.append((name, value))
+    return tuple(sorted(pairs)) if pairs else None
+
+
 def specification_text(raw):
     """Compare list-shaped SKU specs with the detail page's text form.
 
     The sold-order API returns ``[{name, value}]`` while the detail DOM
     collector returns strings such as ``name:value``.  They are the same
-    source fact, so canonicalize both forms before conflict checks.
+    source fact. Only complete named attributes may ignore presentation order;
+    unstructured or ambiguous text retains the existing ordered comparison.
     """
+    pairs = named_specification_pairs(raw)
+    if pairs is not None:
+        return ('named_attributes', pairs)
     if isinstance(raw, (list, tuple)):
         parts = []
         for item in raw:
@@ -204,3 +241,222 @@ def attach_amount_evidence(normalized, evidence):
             require(number(item['match_amount'])==amount,'同一子订单金额证据冲突')
             continue
         item.update(match_amount=str(amount),match_amount_source=amount_source,amount_evidence=e)
+
+
+def attach_detail_gross_evidence(normalized, details, root=None):
+    """Keep raw detail proof without claiming that any source row is unique."""
+    by_key = {item_key(item): item for item in normalized}
+    for detail in details:
+        key = item_key(detail['item'])
+        require(key in by_key, '详情金额原件不在订单明细集合')
+        record = deepcopy(detail)
+        if root is not None:
+            record['checkpoint_path'] = str((Path(root) / record['checkpoint']).resolve())
+        by_key[key].setdefault('detail_gross_evidence', []).append(record)
+
+
+def _source_group_signature(row, discount):
+    """All source-dependent match/output facts, excluding row identity."""
+    result = {}
+    for label, current in (('positive', row), ('discount', discount)):
+        if current is None:
+            result[label] = None
+            continue
+        fields = {}
+        for field in ('goods_code', 'sub_order_no', 'source_goods_name',
+                      'source_specification', 'tax_rate_zero'):
+            fields[field] = (rules.normalize_identifier(rules.value(current, field))
+                             if field in {'goods_code', 'sub_order_no'} else
+                             comparable(rules.value(current, field),
+                                        'specification' if field == 'source_specification' else field))
+        for field in ('goods_amount', 'quantity'):
+            raw = rules.value(current, field)
+            parsed = number(raw)
+            if rules.clean_text(raw) is not None and parsed is None:
+                return None
+            fields[field] = rules.decimal_text(parsed) if parsed is not None else None
+        raw_rate = rules.value(current, 'tax_rate')
+        errors = []
+        rate = rules.parse_tax_rate(raw_rate, errors) if rules.clean_text(raw_rate) else None
+        if errors:
+            return None
+        fields['tax_rate'] = rules.decimal_text(rate) if rate is not None else None
+        result[label] = fields
+    return json.loads(json.dumps(result, ensure_ascii=False))
+
+
+def _raw_group_item_proof(item, order_items):
+    """Recheck raw DOM provenance and complete detail membership from scratch."""
+    records = item.get('detail_gross_evidence')
+    if not isinstance(records, list) or not records:
+        return None
+    expected = {item_key(candidate): candidate for candidate in order_items}
+    proof_hashes = []
+    gross = None
+    for record in records:
+        if not isinstance(record, dict):
+            return None
+        raw = record.get('item'); document = record.get('document')
+        if not isinstance(raw, dict) or not isinstance(document, dict):
+            return None
+        key = item_key(raw)
+        if key != item_key(item) or document.get('verified_order') is not True:
+            return None
+        if str(document.get('order_no') or '') != key[0] or not document.get('queried_at'):
+            return None
+        if record.get('checkpoint') not in {'old_details.json', 'supplemental_details.json'}:
+            return None
+        if not re.fullmatch(r'[0-9a-f]{64}', str(record.get('checkpoint_sha256') or '')):
+            return None
+        # A recomputed JSON proof alone cannot authenticate its claimed raw
+        # checkpoint. Bind the retained document to the unchanged saved bytes.
+        checkpoint_path = Path(str(record.get('checkpoint_path') or ''))
+        if not checkpoint_path.is_absolute() or checkpoint_path.name != record['checkpoint']:
+            return None
+        try:
+            checkpoint_bytes = checkpoint_path.read_bytes()
+            checkpoint_documents = json.loads(checkpoint_bytes.decode('utf-8-sig'))
+        except (OSError, ValueError, UnicodeError):
+            return None
+        if (hashlib.sha256(checkpoint_bytes).hexdigest() != record['checkpoint_sha256']
+                or not isinstance(checkpoint_documents, list) or document not in checkpoint_documents):
+            return None
+        parsed = urlparse(str(document.get('url') or ''))
+        if (parsed.scheme != 'https' or parsed.hostname not in {'qn.taobao.com', 'trade.taobao.com'}
+                or parse_qs(parsed.query).get('bizOrderId') != [key[0]]):
+            return None
+        raw_items = document.get('items')
+        if not isinstance(raw_items, list) or not all(isinstance(i, dict) for i in raw_items):
+            return None
+        if (len(raw_items) != len(expected) or len({item_key(i) for i in raw_items}) != len(raw_items)
+                or {item_key(i) for i in raw_items} != set(expected) or raw not in raw_items):
+            return None
+        # Every raw detail record must agree with the normalized list identity.
+        for detail_item in raw_items:
+            candidate = expected[item_key(detail_item)]
+            if (not detail_item.get('sub_order_no') or not detail_item.get('goods_code')
+                    or str(detail_item['goods_code']).strip() != candidate.get('goods_code')
+                    or not text(detail_item.get('title'))
+                    or text(detail_item['title']) != text(candidate.get('source_goods_name'))
+                    or number(detail_item.get('quantity')) != number(candidate.get('quantity'))
+                    or specification_text(detail_item.get('specification')) !=
+                    specification_text(candidate.get('source_specification'))):
+                return None
+        price = number(raw.get('unit_price')); quantity = number(raw.get('quantity'))
+        price_cell = re.fullmatch(
+            r'\s*[¥￥]?\s*((?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?)\s*[xX×]\s*([0-9]+(?:\.[0-9]+)?)\s*',
+            str(raw.get('price_cell') or ''))
+        if (raw.get('source') != 'order_detail_dom' or price is None or price <= 0
+                or quantity is None or quantity <= 0 or not price_cell
+                or number(price_cell[1]) != price or number(price_cell[2]) != quantity):
+            return None
+        current_gross = price * quantity
+        if gross is not None and gross != current_gross:
+            return None
+        if item.get('match_amount') is not None and number(item['match_amount']) != current_gross:
+            return None
+        gross = current_gross
+        proof_hashes.append(rules.canonical_hash(record))
+    return {'gross': gross, 'raw_evidence_sha256': sorted(set(proof_hashes))}
+
+
+def equivalent_group_assignments(rows, items):
+    """Prove a whole-order permutation invariant, never a source-row identity.
+
+    This deliberately accepts only all-to-all groups of equal economic source
+    rows. Every distinct order item is used exactly once with the same quantity,
+    gross amount and adjacent discount, so any permutation has the same complete
+    business output multiset. No price-only inference or partial subgroup joins.
+    """
+    if not rows or len({str(rules.value(row, 'application_no') or '') for _, row in rows}) != 1:
+        return {}
+    serial = str(rules.value(rows[0][1], 'application_no') or '')
+    if not serial:
+        return {}
+    # A discount with no order identity cannot be silently left out of a group.
+    if any(number(rules.value(row, 'goods_amount')) is not None
+           and number(rules.value(row, 'goods_amount')) < 0
+           and not rules.clean_text(rules.value(row, 'order_no')) for _, row in rows):
+        return {}
+    by_order = {}
+    for rn, row in rows:
+        order = str(rules.value(row, 'order_no') or '')
+        if order:
+            by_order.setdefault(order, []).append((rn, row))
+    result = {}
+    for order, source_rows in by_order.items():
+        candidates = [item for item in items if str(item.get('order_no') or '') == order]
+        keys = [item_key(item) for item in candidates]
+        if (len(candidates) < 2 or len(set(keys)) != len(keys)
+                or any(not key[1] for key in keys)
+                or any(not rules.clean_text(item.get('goods_code')) for item in candidates)):
+            continue
+        pairs = []; invalid = False
+        for rn, row in source_rows:
+            amount = number(rules.value(row, 'goods_amount'))
+            if (amount is None or amount == 0
+                    or rules.clean_text(rules.value(row, 'source_goods_name')) == '价外费用'):
+                invalid = True; break
+            if amount > 0:
+                quantity = number(rules.value(row, 'quantity'))
+                if quantity is None or quantity <= 0 or not text(rules.value(row, 'source_goods_name')):
+                    invalid = True; break
+                pairs.append([rn, row, None, None])
+            else:
+                if (not pairs or pairs[-1][2] is not None or rn != pairs[-1][0] + 1
+                        or abs(amount) > number(rules.value(pairs[-1][1], 'goods_amount'))):
+                    invalid = True; break
+                pairs[-1][2:] = [rn, row]
+        if invalid or len(pairs) != len(candidates):
+            continue
+        signatures = [_source_group_signature(row, discount) for _, row, _, discount in pairs]
+        if signatures[0] is None or any(signature != signatures[0] for signature in signatures):
+            continue
+        item_proofs = [_raw_group_item_proof(item, candidates) for item in candidates]
+        if any(proof is None for proof in item_proofs):
+            continue
+        # Check every edge, including explicit discount identities. Equality of
+        # a total alone cannot establish any of these per-item facts.
+        for rn, row, dr, discount in pairs:
+            for item, item_proof in zip(candidates, item_proofs):
+                raw_item = item['detail_gross_evidence'][0]['item']
+                if (not compatible(row, raw_item)
+                        or item_proof['gross'] != number(rules.value(row, 'goods_amount'))):
+                    invalid = True; break
+                for field in ('goods_code', 'sub_order_no'):
+                    constraint = rules.normalize_identifier(rules.value(row, field))
+                    if constraint and constraint != rules.normalize_identifier(raw_item.get(field)):
+                        invalid = True; break
+                if invalid:
+                    break
+                if discount is not None:
+                    for field, raw_field in (('goods_code', 'goods_code'), ('sub_order_no', 'sub_order_no'),
+                                             ('source_goods_name', 'title'), ('source_specification', 'specification')):
+                        kind = 'specification' if raw_field == 'specification' else field
+                        constraint = (rules.normalize_identifier(rules.value(discount, field))
+                                      if field in {'goods_code', 'sub_order_no'} else
+                                      comparable(rules.value(discount, field), kind))
+                        actual = (rules.normalize_identifier(raw_item.get(raw_field))
+                                  if field in {'goods_code', 'sub_order_no'} else
+                                  comparable(raw_item.get(raw_field), kind))
+                        if constraint and constraint != actual:
+                            invalid = True; break
+            if invalid:
+                break
+        if invalid:
+            continue
+        ordered_pairs = sorted(pairs, key=lambda pair: pair[0])
+        ordered_items = sorted(candidates, key=lambda item: item_key(item)[1])
+        assignments = [{'source_row': pair[0], 'sub_order_no': item['sub_order_no'],
+                        'goods_code': item['goods_code']} for pair, item in zip(ordered_pairs, ordered_items)]
+        proof = {'version': 1, 'method': 'group_equivalence', 'application_no': serial, 'order_no': order,
+                 'source_rows': [pair[0] for pair in ordered_pairs],
+                 'discount_source_rows': [pair[2] for pair in ordered_pairs],
+                 'sub_order_nos': [item['sub_order_no'] for item in ordered_items],
+                 'economic_signature': signatures[0], 'assignments': assignments,
+                 'raw_evidence_sha256': {item['sub_order_no']: item_proof['raw_evidence_sha256']
+                                         for item, item_proof in zip(candidates, item_proofs)}}
+        proof['proof_sha256'] = rules.canonical_hash(proof)
+        for pair, item in zip(ordered_pairs, ordered_items):
+            result[pair[0]] = {'item': item, 'proof': proof}
+    return result

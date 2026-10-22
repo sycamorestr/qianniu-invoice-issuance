@@ -39,6 +39,7 @@ RUN_INVOICE = HERE / "run_invoice.py"
 # bounded recovery unit while avoiding unnecessary page-evaluate round trips.
 JST_BATCH_SIZE = 40
 APPROVAL_BATCH_MODES = {"single_request", "legacy_20"}
+EXPORT_SERIAL_SOURCES = {"order_no", "application_no"}
 QIANNIU_BROWSER_CONFIG_ENV = "QIANNIU_BROWSER_CONFIG"
 SUPPORTED_BROWSER_CONFIG_SCHEMA = 1
 
@@ -50,6 +51,22 @@ class OnlineError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.site = site if site in {"qianniu", "jst"} else None
+
+
+def frozen_export_serial_source(requested: str | None = None,
+                                saved: dict | None = None) -> str:
+    """Keep output numbering separate from application identity and recovery."""
+    if requested is not None and (
+            not isinstance(requested, str) or requested not in EXPORT_SERIAL_SOURCES):
+        raise OnlineError("输出发票流水号来源无效", "configuration")
+    if saved is None:
+        return requested or "order_no"
+    previous = saved.get("export_serial_source", "application_no")
+    if not isinstance(previous, str) or previous not in EXPORT_SERIAL_SOURCES:
+        raise OnlineError("保存的输出发票流水号来源无效", "checkpoint_invalid")
+    if requested is not None and requested != previous:
+        raise OnlineError("恢复时不能改变输出发票流水号来源；请新建任务应用新规则", "resume_mismatch")
+    return previous
 
 
 def frozen_tax_rate_policy(store: str, config_path: Path | None = None,
@@ -605,6 +622,7 @@ class OnlineRunner:
                  jst_browser_config: Path | None = None,
                  tax_rate_config: Path | None = None,
                  tax_rate_policy: dict | None = None,
+                 export_serial_source: str | None = None,
                  browser_backend: str | None = None,
                  node: str | None = None, node_modules: str | None = None,
                  plan_only: bool = False,
@@ -635,6 +653,8 @@ class OnlineRunner:
         self.store = store
         self.tax_rate_policy = frozen_tax_rate_policy(
             store, tax_rate_config, tax_rate_policy, saved_scope if resume else None)
+        self.export_serial_source = frozen_export_serial_source(
+            export_serial_source, saved_scope if resume else None)
         self.issuer = issuer
         self.agent_id = str(agent_id) if agent_id not in (None, "") else None
         if expected_account is not None and not isinstance(expected_account, str):
@@ -850,6 +870,7 @@ class OnlineRunner:
     def _new_state(self, mode: str) -> dict[str, Any]:
         return {"version": 1, "mode": mode, "date": self.date, **scope_fields(self.query_scope), "store": self.store,
                 "tax_rate_policy": dict(self.tax_rate_policy),
+                "export_serial_source": self.export_serial_source,
                 "agent_id": self.agent_id,
                 "expected_account": self.expected_account,
                 "plan_only": self.plan_only,
@@ -1582,7 +1603,8 @@ class OnlineRunner:
         args = [str(RUN_INVOICE), *scope_args, "--store", self.store,
                 "--issuer", self.issuer, "--input-dir", str(self.input_dir),
                 "--output-dir", str(output_dir),
-                "--tax-rate-policy-file", str(self.tax_rate_policy_path)]
+                "--tax-rate-policy-file", str(self.tax_rate_policy_path),
+                "--export-serial-source", self.export_serial_source]
         if plan_only:
             args.append("--plan-only")
         if self.replay:

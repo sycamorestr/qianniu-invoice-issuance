@@ -545,6 +545,54 @@ class ControllerTests(unittest.TestCase):
             generated = page.evaluate.await_args.args[0]
             self.assertIn('(null,{"code":"A1"})', generated)
             self.assertEqual(generated, '(async()=>await (async function(element,input){return input;})(null,{"code":"A1"}))()')
+
+    def test_reset_and_collector_share_one_captured_goods_frame_evaluation(self):
+        instance = controller.PlaywrightBrowserController(CONFIG)
+        page = FakePage(CONFIG["browser_sessions"]["goods"]["url"])
+        page.evaluate = AsyncMock()
+        page.main_frame = object()
+        frame = SimpleNamespace(url=controller.GOODS_READINESS_FRAME_URL)
+        page.frames = [page.main_frame, frame]
+        captured = []
+
+        async def evaluate(expression):
+            self.assertEqual(captured, [frame])
+            self.assertTrue(expression.startswith(
+                "(() => { globalThis.__qianniuInvoiceStopRequested = false; return ("))
+            self.assertIn('(null,{"code":"A1"})', expression)
+            return {"ok": True}
+
+        frame.evaluate = AsyncMock(side_effect=evaluate)
+        instance.registrations["goods"] = controller.PageRegistration("goods", page)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "page.js"
+            path.write_text("async function(element,input){return input;}", encoding="utf-8")
+            result = asyncio.run(instance.evaluate_file(
+                "goods", path, {"code": "A1"}, frame_url=controller.GOODS_READINESS_FRAME_URL,
+                reset_stop=True, on_target=captured.append))
+        self.assertEqual(result, {"ok": True})
+        frame.evaluate.assert_awaited_once()
+        page.evaluate.assert_not_awaited()
+
+    def test_missing_goods_frame_never_resets_or_dispatches_collector(self):
+        instance = controller.PlaywrightBrowserController(CONFIG)
+        page = FakePage(CONFIG["browser_sessions"]["goods"]["url"])
+        page.evaluate = AsyncMock()
+        page.main_frame = object()
+        page.frames = [page.main_frame]
+        instance.registrations["goods"] = controller.PageRegistration("goods", page)
+        captured = Mock()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "page.js"
+            path.write_text("async function(element,input){return input;}", encoding="utf-8")
+            with self.assertRaises(controller.BrowserControllerError) as caught:
+                asyncio.run(instance.evaluate_file(
+                    "goods", path, {}, frame_url=controller.GOODS_READINESS_FRAME_URL,
+                    reset_stop=True, on_target=captured))
+        self.assertEqual(caught.exception.code, "page_missing")
+        captured.assert_not_called()
+        page.evaluate.assert_not_awaited()
+
     def test_load_config_resolves_profile_and_download_dir(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "browser.json"

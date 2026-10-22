@@ -50,6 +50,31 @@
     return text(codes[0].value);
   };
   const runtimeOrders=[];
+  const snapshotFor=cell=>{
+    const snapshots=[];
+    for(const link of cell.querySelectorAll('a[href]')){
+      const href=link.getAttribute('href')||'';
+      let url;
+      try{url=new URL(href,location.href);}catch(_){
+        if(/tradeSnap\.htm|tradeID/.test(href))throw Error('snapshot_url_invalid');
+        continue;
+      }
+      if(!url.pathname.includes('tradeSnap.htm')&&!url.searchParams.has('tradeID'))continue;
+      if(!['http:','https:'].includes(url.protocol)||url.hostname!=='trade.taobao.com'||
+          url.port||url.username||url.password||url.pathname!=='/trade/detail/tradeSnap.htm'){
+        throw Error('snapshot_url_invalid');
+      }
+      const ids=url.searchParams.getAll('tradeID');
+      if(ids.length!==1||!/^[1-9]\d*$/.test(ids[0]))throw Error('snapshot_sub_order_id_invalid');
+      const title=text(link.innerText);
+      if(!title)throw Error('snapshot_title_missing');
+      snapshots.push({id:ids[0],title,url:`https://trade.taobao.com/trade/detail/tradeSnap.htm?tradeID=${ids[0]}`});
+    }
+    if(!snapshots.length)return null;
+    if(new Set(snapshots.map(snapshot=>snapshot.id)).size!==1)throw Error('snapshot_sub_order_not_unique');
+    if(new Set(snapshots.map(snapshot=>snapshot.title)).size!==1)throw Error('snapshot_title_conflict');
+    return snapshots[0];
+  };
   const validateRuntimeOrder=order=>{
     if(!order.subOrders.length)throw Error('incomplete_order_detail');
     const ids=new Set();
@@ -62,10 +87,13 @@
     }
     runtimeOrders.push(order);
   };
-  const subOrderFor=(order,domItem,firstCell,hasCodeLabel)=>{
+  const subOrderFor=(order,domItem,firstCell,hasCodeLabel,snapshot)=>{
     validateRuntimeOrder(order);
     const candidates=order.subOrders.filter(subOrder=>{
       const itemInfo=subOrder&&subOrder.itemInfo;
+      // Only the product snapshot's string tradeID identifies this DOM row.
+      // It narrows candidates but never bypasses the existing field checks.
+      if(snapshot&&(subOrder.idStr!==snapshot.id||text(itemInfo.title)!==snapshot.title))return false;
       if(runtimeCode(subOrder)!==text(domItem.goods_code)||
           quantity(subOrder.quantity)!==quantity(domItem.quantity))return false;
       if(hasCodeLabel)return text(itemInfo.title)===text(domItem.title);
@@ -85,7 +113,8 @@
     return cells.length>=4&&fiberFor(row)&&/[x×]\s*\d+(?:\.\d+)?/.test(cells.at(-1)?.innerText||'');
   });
   const items=rows.map((row,index)=>{
-    const cells=Array.from(row.querySelectorAll('td')).map(c=>c.innerText.trim());
+    const cellNodes=Array.from(row.querySelectorAll('td'));
+    const cells=cellNodes.map(c=>c.innerText.trim());
     const firstCell=cells[0]||'';
     const codeMatch=/商家编码[:：][^\S\r\n]*([^\n\r]*)/.exec(firstCell);
     const goods_code=codeMatch?.[1]?.trim()||'';
@@ -95,8 +124,10 @@
       unit_price:/([\d,.]+)\s*[x×]/.exec(cells.at(-1)||'')?.[1]?.replace(/,/g,'')||'',
       price_cell:cells.at(-1),specification:cells[1]||'',source:'order_detail_dom',source_row:index+1};
     if(!domItem.title||!quantity(domItem.quantity))throw Error('incomplete_order_detail');
-    const subOrder=subOrderFor(runtimeOrderFor(row),domItem,firstCell,Boolean(codeMatch));
+    const snapshot=snapshotFor(cellNodes[0]);
+    const subOrder=subOrderFor(runtimeOrderFor(row),domItem,firstCell,Boolean(codeMatch),snapshot);
     return {...domItem,title:text(subOrder.itemInfo.title),sub_order_no:subOrder.idStr,
+      ...(snapshot?{sub_order_id_source:'product_snapshot_tradeID',snapshot_url:snapshot.url}:{}),
       ...(!goods_code?{goods_code_missing:true}:{})};
   });
   if(!items.length)throw Error('incomplete_order_detail');

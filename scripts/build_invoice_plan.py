@@ -206,6 +206,7 @@ class InvoiceBuild:
     warnings: list[str] = field(default_factory=list)
     matched_items: dict[int, dict[str, Any]] = field(default_factory=dict)
     used_items: set[tuple[str, int]] = field(default_factory=set)
+    equivalent_groups: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def error(self, message: str) -> None:
         self.errors.append(message)
@@ -307,6 +308,18 @@ def resolve_goods_code(
         build.error(f"源行 {source_row} 的订单 {order_no} 明细缺少商家编码，不能确认商品关联")
         return None
     if items:
+        equivalent = build.equivalent_groups.get(source_row)
+        if equivalent is not None:
+            assigned = equivalent['item']
+            assigned_indices = [index for index, item in items if item == assigned]
+            if (len(assigned_indices) != 1 or (order_no, assigned_indices[0]) in build.used_items
+                    or normalize_identifier(value(assigned, 'goods_code')) not in candidates
+                    or (direct and normalize_identifier(value(assigned, 'goods_code')) != direct)):
+                build.error(f"源行 {source_row} 的整组等价匹配证据冲突或重复使用子订单")
+                return None
+            build.used_items.add((order_no, assigned_indices[0]))
+            build.matched_items[source_row] = assigned
+            return normalize_identifier(value(assigned, 'goods_code'))
         matches = []
         amount_conflict = False
         for index, item in items:
@@ -405,12 +418,16 @@ def details_for(
     order_items: dict[str, list[dict[str, Any]]] | None = None,
     tax_rate_policy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    from order_evidence import equivalent_group_assignments
+
     policy = normalize_policy(tax_rate_policy)
     fixed_rate = policy["source"] == "fixed"
     details: list[dict[str, Any]] = []
     extra_fees: list[tuple[int, dict[str, Any], Decimal]] = []
     previous_positive: dict[str, Any] | None = None
     previous_was_negative = False
+    build.equivalent_groups = equivalent_group_assignments(
+        build.rows, [item for items in (order_items or {}).values() for item in items])
 
     for source_row, row in build.rows:
         is_extra_fee = clean_text(value(row, "source_goods_name")) == "价外费用"
@@ -524,6 +541,9 @@ def details_for(
             "discount_amount": "0",
             "discount_source_row": None,
         }
+        if source_row in build.equivalent_groups and source_row in build.matched_items:
+            detail['match_method'] = 'group_equivalence'
+            detail['group_equivalence'] = build.equivalent_groups[source_row]['proof']
         details.append(detail)
         previous_positive = detail
         previous_was_negative = False

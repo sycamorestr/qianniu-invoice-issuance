@@ -2,23 +2,78 @@
   const input = __INPUT__;
   const {operation} = input;
   const timestamp = () => new Date().toISOString();
-  // Pace every actual order request, including the first page of a new
-  // batch and network retries. A delay only in the outer batch loop misses
-  // pagination and creates bursts against the sold-order endpoint.
-  const ORDER_REQUEST_INTERVAL_MS=3000;
-  async function request(url, options={}) {
+  // Latch cancellation for this invocation. A later operation may reset the
+  // page flag; it must never revive an older evaluation still in its wait.
+  let stopRequested=false;
+  const activeControllers=new Set();
+  const stop=()=>{stopRequested=true;for(const controller of activeControllers)controller.abort();};
+  globalThis.addEventListener?.('qianniu-invoice-stop',stop);
+  try {
+  // Each call is awaited serially, and the delay precedes every actual fetch,
+  // including page changes, exports and read retries. Keep response-body reads
+  // inside the same deadline: headers alone do not complete a request.
+  const REQUEST_INTERVAL_MS=5000,ORDER_REQUEST_INTERVAL_MS=10000;
+  const verificationPattern=/_____tmd_____\/punish|FAIL_SYS_USER_VALIDATE|RGV587_ERROR|滑块验证|拖动滑块|请完成验证|安全验证|访问验证|验证码|访问受限|(?:访问|请求|操作|调用)过于频繁/i;
+  function challengeVisible() {
+    if(stopRequested||globalThis.__qianniuInvoiceStopRequested===true){stopRequested=true;return true;}
+    if(typeof document==='undefined'||typeof document.querySelectorAll!=='function')return false;
+    return [...document.querySelectorAll('iframe,.nc-container,[id^="nc_"][id$="_wrapper"],#baxia-dialog-content')].some(node=>{
+      const rect=node.getBoundingClientRect?.();
+      if(!rect||rect.width<=0||rect.height<=0)return false;
+      const style=typeof getComputedStyle==='function'?getComputedStyle(node):null;
+      if(style&&(style.display==='none'||style.visibility==='hidden'))return false;
+      return String(node.tagName||'').toLowerCase()!=='iframe'||
+        verificationPattern.test([node.src,node.title,node.getAttribute?.('src')].join(' '));
+    });
+  }
+  function checkBody(content, body) {
+    const html=/<(?:!doctype|html|head|body|script)[\s>]/i.test(content);
+    const diagnostic=body&&typeof body==='object'?
+      [body.message,body.msg,body.error,body.errorMsg,body.ret,body.url,body.redirectUrl,
+        body.data?.url,body.data?.redirectUrl].filter(value=>value!=null).join(' '):content;
+    if(verificationPattern.test(diagnostic)||(html&&verificationPattern.test(content)))throw Error('verification_required');
+    if((html&&/login|passport|请先登录|重新登录/i.test(content))||
+      /未登录|登录失效|请先登录|请重新登录|登录超时|login required|session expired|token expired/i.test(diagnostic)||
+      body?.isLogin===false||body?.isLogin===0||[401,403].includes(Number(body?.code)))throw Error('login_required');
+  }
+  async function request(url, options={}, format='json') {
     for(let attempt=0;attempt<3;attempt++){
+      const controller=new AbortController();
+      activeControllers.add(controller);
+      let interrupted=false,timer=null;
+      const guard=()=>{if(challengeVisible()){interrupted=true;controller.abort();}};
+      guard();
+      const watcher=setInterval(guard,500);
       try{
-        if(operation==='orders')await new Promise(r=>setTimeout(r,ORDER_REQUEST_INTERVAL_MS));
-        const response=await fetch(url,{...options,credentials:'include',signal:AbortSignal.timeout(30000)});
+        if(interrupted)throw Error('verification_required');
+        await new Promise(resolve=>setTimeout(resolve,operation==='orders'?ORDER_REQUEST_INTERVAL_MS:REQUEST_INTERVAL_MS));
+        guard();if(interrupted)throw Error('verification_required');
+        timer=setTimeout(()=>controller.abort(),30000);
+        const response=await fetch(url,{...options,credentials:'include',signal:controller.signal});
+        guard();if(interrupted)throw Error('verification_required');
+        if(verificationPattern.test(String(response.url||'')))throw Error('verification_required');
         if(response.status===401||response.status===403||/login|passport/i.test(response.url))throw Error('login_required');
-        if(operation==='orders'&&response.status===429)throw Error('rate_limited');
-        if([429,502,503,504].includes(response.status)&&attempt<2){await new Promise(r=>setTimeout(r,500*(attempt+1)));continue;}
+        if(response.status===429)throw Error('rate_limited');
+        let bytes,content;
+        if(format==='json')content=await response.text();
+        else{
+          bytes=new Uint8Array(await response.arrayBuffer());
+          const charset=/charset=([^;]+)/i.exec(response.headers?.get('content-type')||'')?.[1]||(format==='orders'?'gbk':'utf-8');
+          // XLSX is binary and is not an authentication/error document.
+          content=format==='export'&&bytes[0]===80&&bytes[1]===75?'':new TextDecoder(charset).decode(bytes);
+        }
+        let body;try{body=JSON.parse(content);}catch(_){}
+        guard();if(interrupted)throw Error('verification_required');
+        checkBody(content,body);
+        if([502,503,504].includes(response.status)&&attempt<2)continue;
         if(!response.ok)throw Error(`HTTP ${response.status}`);
-        return response;
+        if(format!=='export'&&body===undefined)throw Error('invalid_json_response');
+        return {status:response.status,body,bytes};
       }catch(error){
-        if(attempt===2||!['TypeError','TimeoutError'].includes(error.name))throw error;
-      }
+        guard();
+        if(interrupted)throw Error('verification_required');
+        if(attempt===2||!['TypeError','TimeoutError','AbortError'].includes(error.name))throw error;
+      }finally{if(timer!==null)clearTimeout(timer);clearInterval(watcher);controller.abort();activeControllers.delete(controller);}
     }
   }
   // The sold-order page sends a complete query object even when the user only
@@ -74,8 +129,8 @@
     const common={startTime,endTime,agentId:String(input.agentId),
       ...(countdownStarted?{rightsRemainTime:'100'}:{})};
     if(operation==='export'){
-      const response=await request('https://einvoice.taobao.com/api/invoice/batch4visitor/apply?'+new URLSearchParams({...common,pageNo:'0',pageSize:'20'}));
-      const bytes=new Uint8Array(await response.arrayBuffer());
+      const response=await request('https://einvoice.taobao.com/api/invoice/batch4visitor/apply?'+new URLSearchParams({...common,pageNo:'0',pageSize:'20'}),{},'export');
+      const bytes=response.bytes;
       // A zero-byte HTTP success is the platform's no-data export. Preserve
       // those bytes; the runner must corroborate an explicitly empty list.
       if(bytes.length&&(bytes[0]!==80||bytes[1]!==75))throw Error('not_xlsx');
@@ -93,7 +148,7 @@
       observed_total:seen.size,rows,list_non_pending_snapshot_rows,duplicate_snapshot_row_count});
     for(let pageNo=0;pageNo<10000;pageNo++){
       const response=await request('https://einvoice.taobao.com/api/qianniu/invoice/list/apply?'+new URLSearchParams({...common,applyListType:'0',pageSize:'20',pageNo:String(pageNo)}));
-      const body=await response.json();
+      const body=response.body;
       if(body.code===1004)throw Error('permission_required');
       // With no applications the live API returns {code:200,total:0,
       // message:'无数据'} without data. Only this explicit zero is empty;
@@ -151,9 +206,8 @@
       const query={...baseQuery,pageNum};
       const params=new URLSearchParams();for(const [k,v] of Object.entries(query))params.set(k,typeof v==='object'?JSON.stringify(v):String(v));
       const response=await request('https://trade.taobao.com/trade/itemlist/asyncSold.htm?event_submit_do_query=1&_input_charset=utf8',
-        {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:params.toString()});
-      const charset=/charset=([^;]+)/i.exec(response.headers.get('content-type')||'')?.[1]||'gbk';
-      const body=JSON.parse(new TextDecoder(charset).decode(await response.arrayBuffer()));
+        {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:params.toString()},'orders');
+      const body=response.body;
       if(!Array.isArray(body.mainOrders)||!body.page)throw Error('invalid_order_response');
       const count=Number(body.page.totalNumber),pages=Number(body.page.totalPage);
       if(!Number.isInteger(count)||!Number.isInteger(pages))throw Error('missing_order_pagination');
@@ -171,4 +225,5 @@
     throw Error('order_pagination_limit');
   }
   throw Error('unknown_read_operation');
+  } finally {globalThis.removeEventListener?.('qianniu-invoice-stop',stop);}
 })()

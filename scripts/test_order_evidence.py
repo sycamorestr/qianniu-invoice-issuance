@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import build_invoice_plan as rules
 from collection_files import read_part, record_parts_manifest
-from order_evidence import merge_order_details, derive_amount_evidence, attach_amount_evidence
+from order_evidence import merge_order_details, derive_amount_evidence, attach_amount_evidence, compatible
 from run_invoice import assemble, verify_sources
 from test_pipeline import fixture
 
@@ -98,6 +98,52 @@ class OrderEvidenceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);write(root/'supplemental_details.json',[document])
                 with self.assertRaises(ValueError,msg=mutation):merge_order_details(root,batch,['123'])
+
+    def test_named_specifications_ignore_attribute_order_without_rewriting_evidence(self):
+        for list_spec in ([{'name':'描述','value':'新货'}, {'name':'净含量','value':'250 克'}],
+                          ['描述:新货', '净含量:250 克']):
+            with self.subTest(list_spec=list_spec), tempfile.TemporaryDirectory() as folder:
+                document,batch,rows=detail_fixture()
+                batch[0]['specification']=deepcopy(list_spec)
+                detail_spec='净含量：250\u00a0克\n描述:新货'
+                document['items'][0]['specification']=detail_spec
+                root=Path(folder);write(root/'supplemental_details.json',[document])
+                original=(root/'supplemental_details.json').read_bytes()
+                items,details,_=merge_order_details(root,batch,['123'])
+                self.assertEqual(items[0]['specification'],list_spec)
+                self.assertEqual(details[0]['item']['specification'],detail_spec)
+                self.assertEqual((root/'supplemental_details.json').read_bytes(),original)
+                self.assertTrue(compatible({**rows[0],'规格':detail_spec},items[0]))
+                self.assertEqual(len(derive_amount_evidence(details,rows)[0]),2)
+
+    def test_named_specification_conflicts_and_incomplete_attributes_stop_merge(self):
+        cases = ['净含量:500克\n描述:新货', '重量:250克\n描述:新货',
+                 '净含量:250克', '净含量:250克\n描述:',
+                 '净含量:250克\n描述:新货\n描述:新货',
+                 '净含量:250克\n描述:新货\n描述:旧货']
+        for detail_spec in cases:
+            with self.subTest(detail_spec=detail_spec), tempfile.TemporaryDirectory() as folder:
+                document,batch,_=detail_fixture()
+                batch[0]['specification']=[{'name':'描述','value':'新货'},
+                                           {'name':'净含量','value':'250克'}]
+                document['items'][0]['specification']=detail_spec
+                root=Path(folder);write(root/'supplemental_details.json',[document])
+                with self.assertRaisesRegex(ValueError,'specification'):
+                    merge_order_details(root,batch,['123'])
+
+    def test_unnamed_or_ambiguous_specifications_do_not_gain_order_insensitivity(self):
+        cases = [(['新货','250克'],'250克\n新货'),
+                 ('描述:新货;净含量:250克','净含量:250克;描述:新货'),
+                 ('描述:新货\n描述:旧货','描述:旧货\n描述:新货'),
+                 ([{'name':'a','value':'bc'}], 'ab:c')]
+        for list_spec,detail_spec in cases:
+            with self.subTest(list_spec=list_spec), tempfile.TemporaryDirectory() as folder:
+                document,batch,_=detail_fixture()
+                batch[0]['specification']=list_spec
+                document['items'][0]['specification']=detail_spec
+                root=Path(folder);write(root/'supplemental_details.json',[document])
+                with self.assertRaisesRegex(ValueError,'specification'):
+                    merge_order_details(root,batch,['123'])
 
     def test_missing_provenance_net_price_and_raw_cell_mismatch_do_not_create_evidence(self):
         for mutation in ('queried_at','url','source','price_cell','unit_price'):

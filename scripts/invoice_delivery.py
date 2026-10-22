@@ -36,6 +36,8 @@ FAILURE_REASONS = {
     'auth_required': '登录认证未通过，需要在原浏览器中处理后恢复',
     'permission_required': '当前账号缺少发票查看权限，需要主账号授权后恢复',
     'context_missing': '业务页面必要信息未就绪，需要恢复原页面后继续',
+    'page_not_ready': '业务页面等待超时，需要检查原页面加载状态后恢复',
+    'verification_required': '平台要求人工验证码，请在原浏览器完成验证后恢复原批次',
     'context_changed': '页面店铺或开票主体发生变化，需要核对原环境',
     'context_mismatch': '当前店铺或开票主体与任务不一致，需要核对原环境',
     'profile_locked': '浏览器环境正被其他任务占用，待释放后恢复',

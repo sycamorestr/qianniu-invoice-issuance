@@ -28,7 +28,8 @@ from playwright_controller import (
 
 
 GOODS_FRAME_URL = "https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index"
-ORDER_NAVIGATION_DELAY_SECONDS = 3.0
+ORDER_NAVIGATION_DELAY_SECONDS = 10.0
+VERIFICATION_POLL_SECONDS = 0.5
 
 
 class PlaywrightAdapterError(RuntimeError):
@@ -51,8 +52,12 @@ def _controller_error_code(error: BrowserControllerError) -> str:
         "login_required": "auth_required",
         "rate_limited": "rate_limited",
         "permission_required": "permission_required",
+        "verification_required": "verification_required",
+        "page_not_ready": "page_not_ready",
         "context_changed_store": "context_changed",
         "context_changed_account": "context_changed",
+        "context_changed_agent_id": "context_changed",
+        "context_ambiguous_agent_id": "context_changed",
         "context_missing_store": "context_missing",
         "context_missing_agent_id": "context_missing",
         "context_missing_account": "context_missing",
@@ -131,6 +136,8 @@ class PlaywrightAdapterRunner:
         self.controllers: dict[str, PlaywrightBrowserController] = {}
         self._created_controllers: list[PlaywrightBrowserController] = []
         self._operation_tasks: set[asyncio.Task[Any]] = set()
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._operation_targets: dict[asyncio.Task[Any], list[Any]] = {}
         self.thread: threading.Thread | None = None
         self.ready = threading.Event()
         self.start_error: BaseException | None = None
@@ -180,21 +187,74 @@ class PlaywrightAdapterRunner:
         # must not continue after this job has released either profile lock.
         # Playwright also owns background transport tasks in this loop. Leave
         # them running until controller.close() disconnects them cleanly.
+        cancelled = False
         pending = [task for task in self._operation_tasks if task is not asyncio.current_task()]
         for task in pending:
             task.cancel()
         if pending:
-            try:
-                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5)
-            except (TimeoutError, asyncio.CancelledError):
-                pass
+            cancelled |= await self._wait_cleanup_uninterrupted(
+                asyncio.gather(*pending, return_exceptions=True))
+        # Cleanup is independent of the wrapper task: a second cancellation
+        # must not release a profile while page JS or its child task still runs.
+        pending_cleanup = list(self._cleanup_tasks)
+        if pending_cleanup:
+            cancelled |= await self._wait_cleanup_uninterrupted(
+                asyncio.gather(*pending_cleanup, return_exceptions=True))
         for controller in reversed(self._created_controllers):
             try:
-                await asyncio.wait_for(controller.close(), timeout=10)
+                close_task = asyncio.create_task(asyncio.wait_for(controller.close(), timeout=10))
+                cancelled |= await self._wait_cleanup_uninterrupted(
+                    asyncio.gather(close_task, return_exceptions=True))
             except (Exception, asyncio.CancelledError):
                 # close() releases its OS lock in finally even if detaching
                 # a disconnected browser or stopping the runtime fails.
                 pass
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @staticmethod
+    async def _wait_cleanup_uninterrupted(task: asyncio.Future) -> bool:
+        """Defer caller cancellation until cleanup finishes, without losing it."""
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(task)
+                return cancelled
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
+
+    async def _stop_page_requests(self, site: str, role: str, controller: Any,
+                                  captured_targets: list[Any] | None = None) -> None:
+        targets = list(captured_targets or [])
+        try:
+            page = controller.page(role)
+            targets.append(page)
+            if site == "jst":
+                targets.extend(frame for frame in page.frames
+                               if frame is not page.main_frame and GOODS_FRAME_URL in str(frame.url or ""))
+        except Exception:
+            pass
+        targets = list({id(target): target for target in targets}.values())
+
+        async def signal(target: Any) -> None:
+            await asyncio.wait_for(target.evaluate(
+                "() => { globalThis.__qianniuInvoiceStopRequested = true; "
+                "globalThis.dispatchEvent(new Event('qianniu-invoice-stop')); }"), timeout=2)
+
+        # An outer-page failure must not prevent cancelling the shared goods
+        # iframe. Each context has its own latch and active fetch controllers.
+        await asyncio.gather(*(signal(target) for target in targets), return_exceptions=True)
+
+    async def _cancel_operation(self, operation_task: asyncio.Task[Any],
+                                site: str, role: str, controller: Any) -> None:
+        try:
+            await self._stop_page_requests(site, role, controller,
+                                           self._operation_targets.get(operation_task))
+        finally:
+            operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
 
     def _start(self) -> None:
         def worker() -> None:
@@ -279,8 +339,11 @@ class PlaywrightAdapterRunner:
 
     async def _context_qianniu(self, payload: dict[str, Any]) -> dict[str, Any]:
         controller = self._controller_for("qianniu")
+        await controller.wait_for_business_ready("invoice")
+        if payload.get("prepare_orders"):
+            await controller.wait_for_business_ready("orders")
         value = await controller.evaluate_file(
-            "invoice", self.skill_dir / "playwright_context_qianniu.js", payload
+            "invoice", self.skill_dir / "playwright_context_qianniu.js", payload, reset_stop=True
         )
         pages = await self._pages_receipt()
         value["browser_pages"] = {"invoice": pages.get("invoice"),
@@ -289,6 +352,7 @@ class PlaywrightAdapterRunner:
 
     async def _context_jst(self, payload: dict[str, Any]) -> dict[str, Any]:
         controller = self._controller_for("jst")
+        await controller.wait_for_business_ready("goods")
         page = controller.page("goods")
         label = await page.evaluate("""() => {
           const values = [...document.querySelectorAll('.companyInfoBox__name')]
@@ -375,19 +439,50 @@ class PlaywrightAdapterRunner:
         task = asyncio.current_task()
         if task is not None:
             self._operation_tasks.add(task)
+        operation_task = None
+        controller = None
+        role = "goods" if site == "jst" else ("orders" if operation in {"orders", "detail"} else "invoice")
         try:
-            return await self._invoke_for_site(site, operation, payload, binary)
+            controller = self._controller_for(site)
+            await controller.raise_if_verification_required(role)
+            operation_task = asyncio.create_task(self._invoke_for_site(site, operation, payload, binary))
+            self._operation_targets[operation_task] = []
+            while True:
+                completed, _ = await asyncio.wait({operation_task}, timeout=VERIFICATION_POLL_SECONDS)
+                if completed:
+                    return await operation_task
+                # Frame.url sees cross-origin challenge navigations even when
+                # the outer iframe's src attribute has not changed.
+                await controller.raise_if_verification_required(role)
         except PlaywrightAdapterError as exc:
             if exc.site is None:
                 exc.site = site
             raise
         except BrowserControllerError as exc:
-            raise PlaywrightAdapterError(str(exc), _controller_error_code(exc), site=site) from exc
+            code = _controller_error_code(exc)
+            message = f"verification_required: {exc}" if code == "verification_required" else str(exc)
+            raise PlaywrightAdapterError(message, code, site=site) from exc
         except Exception as exc:
             raise PlaywrightAdapterError(f"页面采集失败: {exc}", "request_failed", site=site) from exc
         finally:
-            if task is not None:
-                self._operation_tasks.discard(task)
+            cleanup_task = None
+            try:
+                if operation_task is not None and not operation_task.done():
+                    # Cancelling Playwright's await does not cancel page JS.
+                    # A shielded, tracked task signals it and joins the child
+                    # even if timeout handling and shutdown both cancel us.
+                    cleanup_task = asyncio.create_task(
+                        self._cancel_operation(operation_task, site, role, controller))
+                    self._cleanup_tasks.add(cleanup_task)
+                    if await self._wait_cleanup_uninterrupted(cleanup_task):
+                        raise asyncio.CancelledError
+            finally:
+                if cleanup_task is not None and cleanup_task.done():
+                    self._cleanup_tasks.discard(cleanup_task)
+                if operation_task is not None:
+                    self._operation_targets.pop(operation_task, None)
+                if task is not None:
+                    self._operation_tasks.discard(task)
 
     async def _approval(self, operation: str, payload: dict[str, Any], binary: bool) -> dict[str, Any]:
         """Pin the captured identity before any approval read or write."""
@@ -403,10 +498,14 @@ class PlaywrightAdapterRunner:
                 or "repeatCheck" in payload or "autoCreate" in payload):
             raise PlaywrightAdapterError("批量同意缺少精确申请或原店铺身份", "configuration", site="qianniu")
         controller = self._controller_for("qianniu")
+        # approval-status runs before the durable send intent; fail a passive
+        # readiness/challenge check there before any approval can be sent.
+        await controller.wait_for_business_ready("invoice")
         # Existing workbench aliases are valid only with the exact saved login.
         context_payload = {**payload, "expected_account": payload.get("expected_account")
                            or payload["expected_account_nick"]}
-        await controller.evaluate_file("invoice", self.skill_dir / "playwright_context_qianniu.js", context_payload)
+        await controller.evaluate_file("invoice", self.skill_dir / "playwright_context_qianniu.js",
+                                       context_payload, reset_stop=True)
         value = await controller.evaluate_file("invoice", self.skill_dir / "approve_qianniu.js", payload)
         if (not isinstance(value, dict) or value.get("operation") != operation
                 or value.get("date") != payload.get("date")
@@ -440,8 +539,9 @@ class PlaywrightAdapterRunner:
             role = "orders" if operation in {"orders", "detail"} else "invoice"
             if operation == "orders":
                 requested_orders = self._validate_orders_request(payload)
+                await controller.wait_for_business_ready(role)
                 value = await controller.evaluate_file(
-                    role, self.skill_dir / "read_qianniu.js", payload
+                    role, self.skill_dir / "read_qianniu.js", payload, reset_stop=True
                 )
                 return self._validate_orders_response(value, requested_orders)
             if operation == "detail":
@@ -469,16 +569,22 @@ class PlaywrightAdapterRunner:
                 await page.goto(str(restore_url), wait_until="domcontentloaded", timeout=self.timeout_ms)
                 return value
             source = self.skill_dir / "read_qianniu.js"
-            value = await controller.evaluate_file(role, source, payload)
+            await controller.wait_for_business_ready(role)
+            value = await controller.evaluate_file(role, source, payload, reset_stop=True)
             if binary:
                 if not isinstance(value, dict) or not isinstance(value.get("base64"), str):
                     raise PlaywrightAdapterError("千牛导出没有返回 XLSX 字节", "response_invalid")
                 return base64.b64decode(value["base64"])
             return value
         if site == "jst" and operation == "query":
+            await controller.wait_for_business_ready("goods")
+            operation_task = asyncio.current_task()
+            def capture_target(target: Any) -> None:
+                if operation_task is not None:
+                    self._operation_targets.setdefault(operation_task, []).append(target)
             value = await controller.evaluate_file(
                 "goods", self.skill_dir / "query_jst_invoice_goods.js", payload,
-                frame_url=GOODS_FRAME_URL,
+                frame_url=GOODS_FRAME_URL, reset_stop=True, on_target=capture_target,
             )
             if not isinstance(value, dict):
                 raise PlaywrightAdapterError("票聚返回不是对象", "response_invalid")
@@ -495,7 +601,9 @@ class PlaywrightAdapterRunner:
         # Allow pacing/pagination and the two detail navigations without
         # consuming the old single-operation watchdog. Network/navigation
         # timeouts still apply and the overall operation remains bounded.
-        budget = {"orders": 120, "detail": 90, "approval-status": 120}.get(operation) if site == "qianniu" else None
+        budget = ({"context": 150, "applications": 900, "export": 180,
+                   "orders": 600, "detail": 180, "approval-status": 900,
+                   "approve": 150}.get(operation) if site == "qianniu" else 120)
         value = self._call(self._invoke_async(site, operation, payload, binary),
                            site=site, timeout_seconds=budget)
         if binary and isinstance(value, (bytes, bytearray)):

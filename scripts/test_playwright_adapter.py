@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, AsyncMock, Mock
+from unittest.mock import patch, AsyncMock, Mock, ANY
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -43,6 +43,7 @@ class FakePage:
         self.url = ORDERS_URL
         self.goto_calls: list[tuple[str, dict]] = []
         self.wait_calls: list[tuple[str, str, int | None]] = []
+        self.evaluate = AsyncMock()
 
     async def goto(self, url: str, **kwargs) -> None:
         self.goto_calls.append((url, kwargs))
@@ -59,19 +60,30 @@ class FakeController:
         self.evaluate_calls: list[tuple[str, Path, dict]] = []
 
     def page(self, role: str):
-        assert role == "orders"
         return self.page_value
 
-    async def evaluate_file(self, role: str, source_path: Path, payload: dict):
+    async def wait_for_business_ready(self, role: str):
+        return {"ready": True}
+
+    async def raise_if_verification_required(self, role: str):
+        return None
+
+    async def evaluate_file(self, role: str, source_path: Path, payload: dict, **_kwargs):
         self.evaluate_calls.append((role, source_path, payload))
         return self.value
 
 
 def make_runner(controller: FakeController) -> playwright_adapter.PlaywrightAdapterRunner:
+    if isinstance(controller, Mock):
+        controller.wait_for_business_ready = AsyncMock()
+        controller.raise_if_verification_required = AsyncMock()
+        controller.page.return_value = FakePage()
     runner = object.__new__(playwright_adapter.PlaywrightAdapterRunner)
     runner.controller = controller
     runner.controllers = {"qianniu": controller, "jst": controller}
     runner._operation_tasks = set()
+    runner._cleanup_tasks = set()
+    runner._operation_targets = {}
     runner.config = {"browser_sessions": {"orders": {"url": ORDERS_URL}}}
     runner.skill_dir = SCRIPT_DIR
     runner.timeout_ms = 30_000
@@ -81,6 +93,235 @@ def make_runner(controller: FakeController) -> playwright_adapter.PlaywrightAdap
 
 
 class PlaywrightAdapterTests(unittest.TestCase):
+    def test_readiness_failure_never_starts_order_fetch(self):
+        controller = FakeController(FakePage(), None)
+        controller.wait_for_business_ready = AsyncMock(side_effect=BrowserControllerError(
+            "orders 未就绪", "page_not_ready"))
+        runner = make_runner(controller)
+        with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+            asyncio.run(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+        self.assertEqual(caught.exception.code, "page_not_ready")
+        self.assertEqual(controller.evaluate_calls, [])
+
+    def test_wait_finishes_before_order_fetch(self):
+        events = []
+        controller = FakeController(FakePage(), {"batches": [], "items": [], "missing": ["A"]})
+        async def ready(role):
+            events.append("waiting")
+            await asyncio.sleep(0)
+            events.append("ready")
+        async def collect(*_args, **_kwargs):
+            events.append("fetch")
+            return controller.value
+        controller.wait_for_business_ready = AsyncMock(side_effect=ready)
+        controller.evaluate_file = AsyncMock(side_effect=collect)
+        runner = make_runner(controller)
+        asyncio.run(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+        self.assertEqual(events, ["waiting", "ready", "fetch"])
+
+    def test_loading_page_has_no_early_reset_before_business_readiness(self):
+        page = FakePage()
+        page.evaluate = AsyncMock(side_effect=RuntimeError("Execution context was destroyed"))
+        response = {"batches": [], "items": [], "missing": ["A"]}
+        controller = FakeController(page, response)
+        controller.wait_for_business_ready = AsyncMock(return_value={"ready": True})
+        controller.evaluate_file = AsyncMock(return_value=response)
+        runner = make_runner(controller)
+        self.assertEqual(asyncio.run(runner._invoke_async(
+            "qianniu", "orders", {"orders": ["A"]}, False)), response)
+        controller.wait_for_business_ready.assert_awaited_once_with("orders")
+        controller.evaluate_file.assert_awaited_once_with(
+            "orders", SCRIPT_DIR / "read_qianniu.js", {"orders": ["A"], "operation": "orders"},
+            reset_stop=True)
+        page.evaluate.assert_not_awaited()
+
+    def test_existing_verification_stops_before_any_script_or_navigation(self):
+        page = FakePage()
+        controller = FakeController(page, None)
+        controller.raise_if_verification_required = AsyncMock(side_effect=BrowserControllerError(
+            "人工滑块验证", "verification_required"))
+        runner = make_runner(controller)
+        with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+            asyncio.run(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+        self.assertEqual(caught.exception.code, "verification_required")
+        self.assertEqual(caught.exception.site, "qianniu")
+        self.assertEqual(controller.evaluate_calls, [])
+        self.assertEqual(page.goto_calls, [])
+        page.evaluate.assert_not_awaited()
+
+    def test_new_challenge_cancels_hung_request_and_signals_page_to_stop(self):
+        page = FakePage()
+        controller = FakeController(page, None)
+        cancelled = []
+        async def hung(*_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+        controller.evaluate_file = AsyncMock(side_effect=hung)
+        controller.raise_if_verification_required = AsyncMock(side_effect=[
+            None, BrowserControllerError("人工滑块验证", "verification_required")])
+        runner = make_runner(controller)
+        with patch.object(playwright_adapter, "VERIFICATION_POLL_SECONDS", 0.001), \
+                self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+            asyncio.run(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+        self.assertEqual(caught.exception.code, "verification_required")
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(controller.evaluate_file.await_count, 1)
+        self.assertIn("= true", page.evaluate.await_args.args[0])
+        self.assertEqual(runner._operation_tasks, set())
+
+    def test_timeout_then_shutdown_waits_for_stop_and_child_before_releasing_lock(self):
+        async def scenario():
+            events = []
+            started, stop_entered, allow_stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            page = FakePage()
+            controller = FakeController(page, None)
+            child_tasks = []
+
+            async def evaluate(source):
+                if "= true" in source:
+                    stop_entered.set()
+                    await allow_stop.wait()
+                    events.append("page_stop")
+
+            async def hung(*_args, **_kwargs):
+                child_tasks.append(asyncio.current_task())
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("child_cancelled")
+
+            async def close():
+                self.assertTrue(child_tasks[0].done())
+                events.append("lock_released")
+
+            page.evaluate = AsyncMock(side_effect=evaluate)
+            controller.evaluate_file = AsyncMock(side_effect=hung)
+            controller.close = AsyncMock(side_effect=close)
+            runner = make_runner(controller)
+            runner._created_controllers = [controller]
+            wrapper = asyncio.create_task(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+            await started.wait()
+            wrapper.cancel()  # _call's first cancellation on watchdog expiry.
+            await stop_entered.wait()
+            shutdown = asyncio.create_task(runner._shutdown())  # Cancels it again.
+            await asyncio.sleep(0)
+            self.assertGreaterEqual(wrapper.cancelling(), 2)
+            self.assertFalse(wrapper.done())
+            controller.close.assert_not_awaited()
+            allow_stop.set()
+            await shutdown
+            with self.assertRaises(asyncio.CancelledError):
+                await wrapper
+            self.assertEqual(events, ["page_stop", "child_cancelled", "lock_released"])
+            self.assertEqual(runner._operation_tasks, set())
+            self.assertEqual(runner._cleanup_tasks, set())
+
+        asyncio.run(scenario())
+
+    def test_shutdown_cancellation_is_preserved_after_page_and_child_cleanup(self):
+        async def scenario():
+            events = []
+            started, stop_entered, allow_stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            page = FakePage()
+            controller = FakeController(page, None)
+
+            async def evaluate(source):
+                if "= true" in source:
+                    stop_entered.set()
+                    await allow_stop.wait()
+                    events.append("page_stop")
+
+            async def hung(*_args, **_kwargs):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("child_cancelled")
+
+            async def close():
+                events.append("lock_released")
+
+            page.evaluate = AsyncMock(side_effect=evaluate)
+            controller.evaluate_file = AsyncMock(side_effect=hung)
+            controller.close = AsyncMock(side_effect=close)
+            runner = make_runner(controller)
+            runner._created_controllers = [controller]
+            wrapper = asyncio.create_task(runner._invoke_async("qianniu", "orders", {"orders": ["A"]}, False))
+            await started.wait()
+            shutdown = asyncio.create_task(runner._shutdown())
+            await stop_entered.wait()
+            shutdown.cancel()
+            await asyncio.sleep(0)
+            shutdown.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(shutdown.done())
+            controller.close.assert_not_awaited()
+            allow_stop.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await shutdown
+            with self.assertRaises(asyncio.CancelledError):
+                await wrapper
+            self.assertEqual(events, ["page_stop", "child_cancelled", "lock_released"])
+            self.assertEqual(runner._operation_tasks, set())
+            self.assertEqual(runner._cleanup_tasks, set())
+
+        asyncio.run(scenario())
+
+    def test_shared_goods_stop_reaches_iframe_even_when_outer_page_fails(self):
+        page = FakePage()
+        page.evaluate = AsyncMock(side_effect=RuntimeError("outer context replaced"))
+        page.main_frame = object()
+        goods_frame = Mock(url=playwright_adapter.GOODS_FRAME_URL, evaluate=AsyncMock())
+        other_frame = Mock(url="https://example.test/unrelated", evaluate=AsyncMock())
+        page.frames = [page.main_frame, goods_frame, other_frame]
+        controller = FakeController(page, None)
+        runner = make_runner(controller)
+        asyncio.run(runner._stop_page_requests("jst", "goods", controller))
+        page.evaluate.assert_awaited_once()
+        goods_frame.evaluate.assert_awaited_once()
+        other_frame.evaluate.assert_not_awaited()
+        self.assertIn("qianniu-invoice-stop", goods_frame.evaluate.await_args.args[0])
+
+    def test_goods_query_cancellation_stops_captured_frame_after_its_url_changes(self):
+        async def scenario():
+            page = FakePage()
+            page.main_frame = object()
+            frame = Mock(url=playwright_adapter.GOODS_FRAME_URL, evaluate=AsyncMock())
+            page.frames = [page.main_frame, frame]
+            controller = FakeController(page, None)
+            controller.wait_for_business_ready = AsyncMock()
+            controller.raise_if_verification_required = AsyncMock(side_effect=[
+                None, BrowserControllerError("人工验证", "verification_required")])
+            child_cancelled = []
+
+            async def query(_role, _source, _payload, *, frame_url, reset_stop, on_target):
+                self.assertEqual(frame_url, playwright_adapter.GOODS_FRAME_URL)
+                self.assertTrue(reset_stop)
+                on_target(frame)
+                frame.url = "https://src.erp321.com/changed-by-spa"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    child_cancelled.append(True)
+
+            controller.evaluate_file = AsyncMock(side_effect=query)
+            runner = make_runner(controller)
+            with patch.object(playwright_adapter, "VERIFICATION_POLL_SECONDS", 0.001):
+                with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as caught:
+                    await runner._invoke_async("jst", "query", {"codes": ["A"]}, False)
+            self.assertEqual(caught.exception.code, "verification_required")
+            controller.wait_for_business_ready.assert_awaited_once_with("goods")
+            frame.evaluate.assert_awaited_once()
+            self.assertIn("qianniu-invoice-stop", frame.evaluate.await_args.args[0])
+            self.assertEqual(child_cancelled, [True])
+            self.assertEqual(runner._operation_targets, {})
+            self.assertEqual(runner._cleanup_tasks, set())
+
+        asyncio.run(scenario())
+
     def test_daily_adapter_uses_native_start_entry_point_without_connect_fallback(self):
         controller = type("AttachedController", (), {
             "connect": AsyncMock(), "close": AsyncMock(), "start": AsyncMock(),
@@ -207,7 +448,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
         self.assertEqual(controller.evaluate_calls, [])
         self.assertEqual(len(page.goto_calls), 1)
         self.assertIn("bizOrderId=9000000000000000001", page.url)
-        delay.assert_awaited_once_with(3)
+        delay.assert_awaited_once_with(10)
 
     def test_consecutive_details_wait_before_each_navigation(self):
         order_ids = ("9000000000000000001", "9000000000000000002")
@@ -241,14 +482,14 @@ class PlaywrightAdapterTests(unittest.TestCase):
             asyncio.run(exercise())
 
         self.assertEqual(events, [
-            ("wait", 3),
-            ("navigate", 3, f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_ids[0]}"),
-            ("collect", 3, order_ids[0]),
-            ("wait", 3), ("navigate", 6, ORDERS_URL),
-            ("wait", 3),
-            ("navigate", 9, f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_ids[1]}"),
-            ("collect", 9, order_ids[1]),
-            ("wait", 3), ("navigate", 12, ORDERS_URL),
+            ("wait", 10),
+            ("navigate", 10, f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_ids[0]}"),
+            ("collect", 10, order_ids[0]),
+            ("wait", 10), ("navigate", 20, ORDERS_URL),
+            ("wait", 10),
+            ("navigate", 30, f"https://qn.taobao.com/home.htm/trade-platform/tp/detail?bizOrderId={order_ids[1]}"),
+            ("collect", 30, order_ids[1]),
+            ("wait", 10), ("navigate", 40, ORDERS_URL),
         ])
 
     def test_detail_navigation_or_collection_failure_never_restores_page(self):
@@ -266,7 +507,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
                         self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
                     asyncio.run(runner._invoke_async(
                         "qianniu", "detail", {"order_no": "9000000000000000001"}, False))
-                delay.assert_awaited_once_with(3)
+                delay.assert_awaited_once_with(10)
                 if failure_at == "goto":
                     page.goto.assert_awaited_once()
                     self.assertEqual(controller.evaluate_calls, [])
@@ -353,7 +594,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
         controller.evaluate_file.assert_awaited_once_with(
             "goods", SCRIPT_DIR / "query_jst_invoice_goods.js",
             {**payload, "operation": "query"},
-            frame_url=playwright_adapter.GOODS_FRAME_URL,
+            frame_url=playwright_adapter.GOODS_FRAME_URL, reset_stop=True, on_target=ANY,
         )
 
     def test_goods_query_rejects_non_object_result(self):
@@ -402,8 +643,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
             # A plain sentinel avoids creating an unawaited coroutine while
             # exercising the public adapter entry point and actual _call.
             runner._invoke_async = Mock(return_value=object())
-            cases = (("qianniu", "orders", 120), ("qianniu", "detail", 90),
-                     ("qianniu", "applications", 60), ("jst", "query", 60))
+            cases = (("qianniu", "orders", 600), ("qianniu", "detail", 180),
+                     ("qianniu", "applications", 900), ("jst", "query", 120))
             for site, operation, expected_timeout in cases:
                 with self.subTest(site=site, operation=operation):
                     future = Mock()
@@ -590,7 +831,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
         order_page = FakePage()
         goods_page = Mock(url=ROLE_URLS["goods"], evaluate=AsyncMock(return_value="示例公司[测试员]"))
         shop = FakeController(order_page, None)
-        goods = Mock()
+        goods = Mock(wait_for_business_ready=AsyncMock(), raise_if_verification_required=AsyncMock())
         shop.status = Mock(return_value={"roles": {role: {"target_id": "shop-" + role}
                                                   for role in ("invoice", "orders")}})
         goods.status.return_value = {"roles": {"goods": {"target_id": "shared-goods"}}}
@@ -634,7 +875,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
 
     def test_operation_errors_preserve_site_for_shared_failure_classification(self):
         shop = FakeController(FakePage(), None)
-        goods = Mock(evaluate_file=AsyncMock(side_effect=BrowserControllerError("会话失效", "auth_required")))
+        goods = Mock(wait_for_business_ready=AsyncMock(), raise_if_verification_required=AsyncMock(),
+                     evaluate_file=AsyncMock(side_effect=BrowserControllerError("会话失效", "auth_required")))
         runner = make_runner(shop)
         runner.controllers["jst"] = goods
         with self.assertRaises(playwright_adapter.PlaywrightAdapterError) as error:
