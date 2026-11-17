@@ -77,8 +77,8 @@
       const response = await fetch(url, {...options, credentials: 'include', signal: controller.signal});
       guard(); if (interrupted) throw Error('verification_required');
       if (verificationPattern.test(String(response.url || ''))) throw Error('verification_required');
-      if (response.status === 401 || response.status === 403 || /login|passport/i.test(response.url)) throw Error('login_required');
       if (response.status === 429) throw Error('rate_limited');
+      if (response.status === 401 || /login|passport/i.test(response.url)) throw Error('login_required');
       const content = await response.text();
       guard(); if (interrupted) throw Error('verification_required');
       let body; try { body = JSON.parse(content); } catch (_) {}
@@ -89,7 +89,8 @@
       if (verificationPattern.test(diagnostic) || (html && verificationPattern.test(content))) throw Error('verification_required');
       if ((html && /login|passport|请先登录|重新登录/i.test(content)) ||
           /未登录|登录失效|请先登录|请重新登录|登录超时|login required|session expired|token expired/i.test(diagnostic) ||
-          body?.isLogin === false || body?.isLogin === 0 || [401, 403].includes(Number(body?.code))) throw Error('login_required');
+          body?.isLogin === false || body?.isLogin === 0 || Number(body?.code) === 401) throw Error('login_required');
+      if (response.status === 403 || Number(body?.code) === 403) throw Error('permission_required');
       if (!response.ok) throw Error(`HTTP ${response.status}`);
       if (body === undefined) throw Error('invalid_json_response');
       return body;
@@ -131,17 +132,26 @@
   }
   if (!applications.length) return {...result, applications: [], checked_at: timestamp()};
   const stable = value => JSON.stringify([value.serialNo, value.tid, value.applyStatus]);
-  async function list(agreed) {
-    const rows = new Map(); let total = null;
+  const targetedQueries = [];
+  async function list(agreed, tid = null) {
+    const rows = new Map(); let total = null, rawRowCount = 0, confirmingShortTail = false;
     for (let pageNo = 0; pageNo < 10000; pageNo++) {
       const common = {startTime, endTime, agentId: String(input.agentId), pageSize: '20', pageNo: String(pageNo)};
       if (!agreed) Object.assign(common, {applyListType: '0', rightsRemainTime: '100'});
+      if (tid !== null) common.tid = tid;
       // Already agreed rows can change their countdown. Their exact serialNo
       // and tid must be verified without applying the pending countdown filter.
       const body = await request('https://einvoice.taobao.com/api/qianniu/invoice/list/apply' +
         (agreed ? '/agreed' : '') + '?' + new URLSearchParams(common));
       if (body?.code === 1004) throw Error('permission_required');
       if (body?.code === 200 && body.total === 0 && body.data == null) body.data = [];
+      // A full final page is followed by an explicit no-data response that
+      // retains the nonzero total. The agreed endpoint can count repeated
+      // rows in that total; keep pending's unique-row requirement unchanged.
+      const explicitTerminal = body?.code === 200 && pageNo > 0 && !Object.hasOwn(body, 'data') &&
+        body.message === '无数据' && total === body.total &&
+        (rows.size >= total || (agreed && rawRowCount >= total));
+      if (explicitTerminal) body.data = [];
       if (body?.code !== 200 || !Array.isArray(body.data) || !Number.isInteger(body.total) || body.total < 0)
         throw Error('invalid_application_response');
       if (total !== null && total !== body.total) throw Error('applications_changed_during_pagination');
@@ -152,6 +162,7 @@
         // string cannot prove that it is the exact exported order identifier.
         if (!validText(row?.serialNo) || !validText(row?.tid) || !Number.isInteger(row.applyStatus))
           throw Error('invalid_approval_application_response');
+        if (tid !== null && row.tid !== tid) throw Error('approval_target_conflict');
         const normalized = {serialNo: row.serialNo, tid: row.tid, applyStatus: row.applyStatus};
         if (rows.has(row.serialNo)) {
           if (stable(rows.get(row.serialNo)) !== stable(normalized)) throw Error('approval_target_conflict');
@@ -160,15 +171,28 @@
         rows.set(row.serialNo, normalized); added++;
       }
       if (body.data.length && !added) throw Error('duplicate_application_page');
+      rawRowCount += body.data.length;
+      if (tid !== null) targetedQueries.push({list: agreed ? 'agreed' : 'pending', query: {...common},
+        total, raw_row_count: body.data.length, explicit_terminal: explicitTerminal,
+        rows: body.data.map(({serialNo, tid, applyStatus}) => ({serialNo, tid, applyStatus})), checked_at: timestamp()});
       if (body.data.length < 20) {
-        if (rows.size < total) throw Error('incomplete_application_pagination');
+        if (rows.size < total && !explicitTerminal) {
+          // Equal overlapping rows can fill the raw total on a short agreed
+          // page. Confirm one real terminal page before accepting that count.
+          if (agreed && !confirmingShortTail && body.data.length > 0 && rawRowCount >= total) {
+            confirmingShortTail = true;
+            continue;
+          }
+          throw Error('incomplete_application_pagination');
+        }
         return rows;
       }
+      if (confirmingShortTail) throw Error('incomplete_application_pagination');
     }
     throw Error('application_pagination_limit');
   }
   const pending = await list(false), agreed = await list(true);
-  const states = applications.map(target => {
+  const stateFor = target => {
     const before = pending.get(target.serialNo), after = agreed.get(target.serialNo);
     if ([before, after].some(row => row && row.tid !== target.tid)) throw Error('approval_target_conflict');
     if (before && after && before.applyStatus !== after.applyStatus) throw Error('approval_target_conflict');
@@ -176,7 +200,30 @@
     if (before?.applyStatus === 1 && !after) status = 'pending';
     if (after?.applyStatus === 2 && (!before || before.applyStatus === 2)) status = 'agreed';
     return {...target, status};
-  });
-  return {...result, applications: states, checked_at: timestamp()};
+  };
+  // Fail existing conflicts before supplementing only genuinely absent targets.
+  applications.forEach(stateFor);
+  const missingTids = [...new Set(applications.filter(target =>
+    !pending.has(target.serialNo) && !agreed.has(target.serialNo)).map(target => target.tid))];
+  const merge = (destination, supplement) => {
+    for (const [serial, row] of supplement) {
+      if (destination.has(serial) && stable(destination.get(serial)) !== stable(row))
+        throw Error('approval_target_conflict');
+      destination.set(serial, row);
+    }
+  };
+  for (const tid of missingTids) {
+    // One complete pair of read-only queries per missing order; never retry or
+    // widen the frozen date/countdown scope, and never infer a missing status.
+    merge(pending, await list(false, tid));
+    merge(agreed, await list(true, tid));
+    applications.forEach(stateFor);
+  }
+  return {...result, applications: applications.map(stateFor), checked_at: timestamp(),
+    ...(targetedQueries.length ? {targeted_reconciliation: {
+      reason: 'absent_from_both_complete_lists', query_scope: scope,
+      expected_identity: {observed_store: input.expected_observed_store,
+        account_nick: input.expected_account_nick, agentId: String(input.agentId)},
+      order_ids: missingTids, queries: targetedQueries}} : {})};
   } finally { globalThis.removeEventListener?.('qianniu-invoice-stop', stop); }
 })()

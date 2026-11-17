@@ -7,7 +7,7 @@
 | shop01 至 shop09 | 每店独立 `user_data_dir` | 采集使用 `invoice`、`orders`；工作台 `home` 保留 | 有 `login_username` 时精确核验完整子账号，否则精确核验 `store` |
 | piaoju | 独立共享 `user_data_dir` | `goods` 及商品 iframe | 每店均核验同一 issuer |
 
-这里的独立 Profile 指独立用户数据根目录，每个通常使用 `Default` 子目录。浏览器会话保存在本机：已开的浏览器直接附着，关闭的浏览器在任务需要时按原配置正常启动一次，读取保存的 Cookie、Local Storage 等。通常可继续使用原登录态，但不承诺免登录；登录过期或验证码仍需人工处理，技能不自动输入账密。
+这里的独立 Profile 指独立用户数据根目录，每个通常使用 `Default` 子目录。浏览器会话保存在本机：已开的浏览器直接附着，关闭的浏览器在任务需要时按原配置正常启动一次，读取保存的 Cookie、Local Storage 等。通常可继续使用原登录态，但不承诺免登录；明确千牛登录失效可按[登录恢复](login-recovery.md)尝试一次飞书 Cookie 兜底，兜底失败、票聚登录失效或验证码仍需人工处理，技能不自动输入账密。
 
 ## 已有浏览器工作台：直接接入
 

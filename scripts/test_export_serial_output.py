@@ -122,7 +122,8 @@ def collision_input_fixture(root):
             'data': [{'input_goods_code': 'SKU-1', 'ok': True,
                       'exact_matches': [{'sku_id': 'SKU-1', 'invoice_enabled': True,
                                          'invoice_name': '测试商品', 'tax_code': '101',
-                                         'properties_value': '250g', 'issuing_office': '袋',
+                                         'properties_value': '原味', 'invoice_spec': '250g',
+                                         'issuing_office': '袋',
                                          'tax_rate': '0.13'}]}],
         },
     }

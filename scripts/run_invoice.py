@@ -515,8 +515,11 @@ def verify_sources(source,plan):
                         '票聚原始编码与括号宽度匹配证据不一致')
             else:
                 require(False,'票聚匹配依据无效')
-            for key,field in [('item_name','invoice_name'),('tax_classification_code','tax_code'),('specification','properties_value'),('unit','issuing_office')]:
-                require((line[key] or '')==(g.get(field) or '').strip(),'票聚字段来源不一致: '+field)
+            for key,field in [('item_name','invoice_name'),('tax_classification_code','tax_code'),('specification','invoice_spec'),('unit','issuing_office')]:
+                raw_value=g.get(field)
+                if key=='specification' and field not in g:
+                    raw_value=g.get('开票规格')
+                require((line[key] or '')==(raw_value or '').strip(),'票聚字段来源不一致: '+field)
                 if key!='specification':
                     require(bool((g.get(field) or '').strip()),'票聚必需字段为空: '+field)
             if fixed_rate:

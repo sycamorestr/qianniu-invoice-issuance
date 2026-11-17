@@ -854,7 +854,10 @@ class OnlineRunner:
         if self._needs_browser and self._browser_runner is None:
             try:
                 from playwright_adapter import PlaywrightAdapterRunner
-                options = {"progress": self.progress}
+                options = {"progress": self.progress, "recovery_identity": {
+                    "expected_store": self.store, "expected_account": self.expected_account,
+                    "expected_issuer": self.issuer,
+                }}
                 if self.connect_only:
                     options["launch_if_needed"] = False
                 if self.jst_browser_config_path is not None:

@@ -46,7 +46,7 @@ old_details.json 与 supplemental_details.json 都必须被消费。按可靠订
 
 商品类型和商品状态均不选。请求 data 省略 sku_type、enabled；返回 enabled 可作为证据，但不据此排除商品。invoice_enabled 是独立字段，必须明确为真。
 
-每个去重编码使用 @@完整编码查询，返回 sku_id 必须完全相同且唯一；千牛/票聚仅出现半角与全角括号差异时，允许将 `(`/`（`、`)`/`）` 归一后唯一匹配，保留接口返回的原始 sku_id 和 match_basis 证据。归一后多个候选仍阻断。不能把其他名称相似项当别名。invoice_name、tax_code、issuing_office 必须有值。properties_value 允许为空；明确存在的原始空值不能被其他别名回填。invoice_spec 永远不作规格来源。
+每个去重编码使用 @@完整编码查询，返回 sku_id 必须完全相同且唯一；千牛/票聚仅出现半角与全角括号差异时，允许将 `(`/`（`、`)`/`）` 归一后唯一匹配，保留接口返回的原始 sku_id 和 match_basis 证据。归一后多个候选仍阻断。不能把其他名称相似项当别名。invoice_name、tax_code、issuing_office 必须有值。规格型号只取 invoice_spec（开票规格），允许为空；为空或缺失时留空，不使用 properties_value（颜色及规格）、订单 SKU 规格或旧规范字段回填。独立复核直接对照原始 invoice_spec。
 
 税率先按技能根目录 `tax-rates.json` 的默认值与完整店铺名例外解析，并在任务开始时冻结。配置格式、覆盖参数与恢复规则见[税率配置](tax-rates.md)。`fixed` 使用配置中的 0 到 1 小数，覆盖票聚以及源商品、折扣、价外费用行税率；税率缺失或不同不再作为该模式的暂缓原因。其他商品核验仍必需，含税金额与数量不改变。配置错误整次停止，不能静默回退。
 

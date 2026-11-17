@@ -77,7 +77,7 @@ def inputs(root, *, scope=ALL, rows=None):
     write(root / 'jst_query.json', {'data': [{'input_goods_code': 'SKU-' + row['申请流水号'], 'ok': True,
           'exact_matches': [{'sku_id': 'SKU-' + row['申请流水号'], 'invoice_enabled': True,
                             'invoice_name': row['货物名称'], 'tax_code': '1010101010000000000',
-                            'properties_value': '', 'issuing_office': '件',
+                            'properties_value': '', 'invoice_spec': '', 'issuing_office': '件',
                             'tax_rate': '0' if row['申请流水号'] == 'A-1' else '0.13'}]}
           for row in active]})
 
@@ -109,8 +109,12 @@ class InvoiceScopePipelineTests(unittest.TestCase):
             collection_files.main()
 
     def run_cli(self, root, output, scope_args, *, plan_only=False, replay=False, render=False):
+        # Scope fixtures assert their synthetic Piaoju rates, never this machine's defaults.
+        policy = root / 'test-tax-policy.json'
+        write(policy, {'source': 'piaoju'})
         argv = ['run_invoice.py', *scope_args, '--store', 'Synthetic shop', '--issuer', 'Synthetic issuer',
-                '--input-dir', str(root), '--output-dir', str(output)]
+                '--input-dir', str(root), '--output-dir', str(output),
+                '--tax-rate-policy-file', str(policy)]
         if plan_only:
             argv.append('--plan-only')
         if replay:

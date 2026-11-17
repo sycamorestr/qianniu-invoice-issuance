@@ -54,15 +54,15 @@ ALIASES = {
     "goods_code": ("goods_code", "商品编码", "sku_id"),
     "item_name": ("item_name", "开票名称", "项目名称", "invoice_name"),
     "tax_classification_code": ("tax_classification_code", "税收编码", "税务编码", "商品和服务税收编码", "tax_code"),
-    "specification": ("properties_value", "颜色及规格", "specification", "规格型号"),
+    "specification": ("invoice_spec", "开票规格"),
     "unit": ("unit", "开票单位", "单位", "issuing_office"),
     "invoice_enabled": ("invoice_enabled", "是否开票"),
 }
 
 
 def value(row: dict[str, Any], field_name: str) -> Any:
-    # Raw color/specification is authoritative, including an explicitly blank value.
-    # invoice_spec is a separate business field and must never fill this column.
+    # Invoice specification is authoritative, including an explicitly blank value.
+    # Color/SKU specifications and legacy normalized values must not fill this column.
     if field_name == "specification":
         for key in ALIASES[field_name]:
             if key in row:

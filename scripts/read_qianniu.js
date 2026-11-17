@@ -34,7 +34,7 @@
     if(verificationPattern.test(diagnostic)||(html&&verificationPattern.test(content)))throw Error('verification_required');
     if((html&&/login|passport|请先登录|重新登录/i.test(content))||
       /未登录|登录失效|请先登录|请重新登录|登录超时|login required|session expired|token expired/i.test(diagnostic)||
-      body?.isLogin===false||body?.isLogin===0||[401,403].includes(Number(body?.code)))throw Error('login_required');
+      body?.isLogin===false||body?.isLogin===0||Number(body?.code)===401)throw Error('login_required');
   }
   async function request(url, options={}, format='json') {
     for(let attempt=0;attempt<3;attempt++){
@@ -52,8 +52,8 @@
         const response=await fetch(url,{...options,credentials:'include',signal:controller.signal});
         guard();if(interrupted)throw Error('verification_required');
         if(verificationPattern.test(String(response.url||'')))throw Error('verification_required');
-        if(response.status===401||response.status===403||/login|passport/i.test(response.url))throw Error('login_required');
         if(response.status===429)throw Error('rate_limited');
+        if(response.status===401||/login|passport/i.test(response.url))throw Error('login_required');
         let bytes,content;
         if(format==='json')content=await response.text();
         else{
@@ -65,6 +65,7 @@
         let body;try{body=JSON.parse(content);}catch(_){}
         guard();if(interrupted)throw Error('verification_required');
         checkBody(content,body);
+        if(response.status===403||Number(body?.code)===403)throw Error('permission_required');
         if([502,503,504].includes(response.status)&&attempt<2)continue;
         if(!response.ok)throw Error(`HTTP ${response.status}`);
         if(format!=='export'&&body===undefined)throw Error('invalid_json_response');

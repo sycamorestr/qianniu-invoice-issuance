@@ -44,7 +44,8 @@ def valid_source() -> dict:
                 "商品编码": "SKU-1",
                 "开票名称": "测试项目",
                 "税收编码": "1010101010000000000",
-                "颜色及规格": "测试规格",
+                "颜色及规格": "测试颜色规格",
+                "开票规格": "测试开票规格",
                 "开票单位": "件",
                 "虚拟分类": "13%",
                 "是否开票": True,
@@ -354,7 +355,7 @@ def test_jst_api_field_aliases_and_strict_virtual_category() -> None:
     assert invoice["errors"] == [], invoice["errors"]
     detail = invoice["detail_lines"][0]
     assert detail["item_name"] == "中秋礼盒"
-    assert detail["specification"] == "8枚装"
+    assert detail["specification"] == "另一种开票规格"
     assert detail["unit"] == "组"
     assert detail["tax_rate"] == "0.13"
 
@@ -366,19 +367,46 @@ def test_disabled_jst_item_is_blocked() -> None:
     assert any("标记为不开票" in error for error in invoice["errors"])
 
 
-def test_specification_uses_color_spec_only() -> None:
+def test_specification_uses_invoice_spec_instead_of_color_or_normalized_aliases() -> None:
     source = valid_source()
     mapping = source["jst_invoice_goods"][0]
     mapping["properties_value"] = "原始颜色规格"
     mapping["specification"] = "过时的规范值"
-    mapping["invoice_spec"] = "开票规格"
-    assert build(source)["detail_lines"][0]["specification"] == "原始颜色规格"
-    mapping["properties_value"] = None
+    mapping["规格型号"] = "过时的规格型号"
+    mapping["invoice_spec"] = "  实际开票规格  "
+    assert build(source)["detail_lines"][0]["specification"] == "实际开票规格"
+
+
+def test_blank_invoice_spec_does_not_fall_back_even_to_chinese_invoice_alias() -> None:
+    for blank in (None, "", " \t "):
+        source = valid_source()
+        mapping = source["jst_invoice_goods"][0]
+        mapping.update(invoice_spec=blank, properties_value="原始颜色规格",
+                       specification="过时的规范值")
+        mapping["规格型号"] = "过时的规格型号"
+        invoice = build(source)
+        assert not invoice["errors"], invoice["errors"]
+        assert invoice["detail_lines"][0]["specification"] is None
+
+
+def test_missing_invoice_spec_does_not_fall_back_to_legacy_aliases() -> None:
+    source = valid_source()
+    mapping = source["jst_invoice_goods"][0]
+    del mapping["开票规格"]
+    mapping.update(properties_value="原始颜色规格", specification="过时的规范值")
+    mapping["规格型号"] = "过时的规格型号"
     assert build(source)["detail_lines"][0]["specification"] is None
-    del mapping["properties_value"]
-    del mapping["specification"]
-    del mapping["颜色及规格"]
-    assert build(source)["detail_lines"][0]["specification"] is None
+
+
+def test_chinese_invoice_specification_alias_is_supported() -> None:
+    source = valid_source()
+    mapping = source["jst_invoice_goods"][0]
+    mapping["properties_value"] = "原始颜色规格"
+    mapping["开票规格"] = "  中文开票规格  "
+    assert build(source)["detail_lines"][0]["specification"] == "中文开票规格"
+    for blank in (None, ""):
+        mapping["开票规格"] = blank
+        assert build(source)["detail_lines"][0]["specification"] is None
 
 
 def test_duplicate_selected_application_is_reported() -> None:

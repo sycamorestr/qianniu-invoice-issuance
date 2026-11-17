@@ -169,7 +169,7 @@ for(const status of [429,403]){
   const clock={elapsed:0,waits:[]},times=[];
   await assert.rejects(()=>run(input,[],soldLocation,async()=>{
     times.push(clock.elapsed);return response({}, {status,ok:false});
-  },clock),status===429?/rate_limited/:/login_required/);
+  },clock),status===429?/rate_limited/:/permission_required/);
   assert.deepEqual(times,[10000]);
 }
 const invoiceClock={elapsed:0,waits:[]};
@@ -195,7 +195,7 @@ for(const failure of ['network','server']){
 }
 const blockedResponses=[
   {reply:response({}, {ok:false,status:429}),reason:/rate_limited/},
-  {reply:response({}, {ok:false,status:403}),reason:/login_required/},
+  {reply:response({}, {ok:false,status:403}),reason:/permission_required/},
   {reply:response({}, {url:'https://trade.taobao.com/_____tmd_____/punish'}),reason:/verification_required/},
   {reply:response({code:200,total:0,message:'请完成滑块验证'}),reason:/verification_required/},
   {reply:response({code:200,total:0,ret:['FAIL_SYS_USER_VALIDATE']}),reason:/verification_required/},

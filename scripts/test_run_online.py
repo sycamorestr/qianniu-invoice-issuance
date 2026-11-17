@@ -704,7 +704,10 @@ class RunOnlineTests(unittest.TestCase):
                     factory.assert_not_called()
                     with run_online.ActiveLock(runner.output_root):
                         runner._connect_browser()
-                    expected = {"progress": runner.progress}
+                    expected = {"progress": runner.progress, "recovery_identity": {
+                        "expected_store": runner.store, "expected_account": runner.expected_account,
+                        "expected_issuer": runner.issuer,
+                    }}
                     if shared is not None:
                         expected["jst_config_path"] = jst.resolve()
                     factory.assert_called_once_with(qianniu.resolve(), **expected)

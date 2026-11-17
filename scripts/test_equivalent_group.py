@@ -70,7 +70,8 @@ def group_fixture():
             'exact_matches': [{'sku_id': item['goods_code'], 'invoice_enabled': True,
                                'invoice_name': '测试曲奇', 'tax_code': '101',
                                'issuing_office': '组', 'tax_rate': '0.13',
-                               'properties_value': item['specification'][0]}]}
+                               'properties_value': item['specification'][0],
+                               'invoice_spec': '曲奇/' + item['specification'][0]}]}
            for item in items]
     return {'rows': rows, 'batch': batch, 'documents': documents, 'jst': jst}
 
@@ -144,7 +145,9 @@ class EquivalentGroupTests(unittest.TestCase):
                              {'SYNTHETIC-SKU-0', 'SYNTHETIC-SKU-1'})
             self.assertEqual({line['sub_order_no'] for line in invoice['detail_lines']}, {'124', '125'})
             self.assertEqual({line['specification'] for line in invoice['detail_lines']},
-                             {'口味:开心果', '口味:树莓'})
+                             {'曲奇/口味:开心果', '曲奇/口味:树莓'})
+            self.assertEqual({tuple(item['source_specification']) for item in source['order_items']},
+                             {('口味:开心果',), ('口味:树莓',)})
             for line in invoice['detail_lines']:
                 self.assertEqual(Decimal(line['quantity']), 1)
                 self.assertEqual(Decimal(line['amount']), Decimal('23'))

@@ -6,6 +6,7 @@ import tempfile
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from zipfile import ZipFile, ZIP_DEFLATED
 from lxml import etree as ET
 import build_invoice_plan as rules
@@ -301,7 +302,7 @@ def fee_verification_fixture():
         {'__source_row':5,'申请流水号':'A-1','订单编号':'O-1','货物名称':'价外费用','数量':'1','商品金额':'1.00'},
     ],'order_items':[evidence],'jst_invoice_goods':[
         {'sku_id':'SKU-1','invoice_enabled':True,'invoice_name':'开票商品甲','tax_code':'101',
-         'properties_value':'规格甲','issuing_office':'件','tax_rate':'0.13'},
+         'properties_value':'颜色规格甲','invoice_spec':'开票规格甲','issuing_office':'件','tax_rate':'0.13'},
     ]}
     basic={key:None for key in ['buyer_tax_id','buyer_address','buyer_phone','buyer_bank','buyer_bank_account','remark','show_buyer_contact']}
     basic.update(invoice_title='购方',tax_included='是')
@@ -310,7 +311,7 @@ def fee_verification_fixture():
         {'source_row':2,'order_no':'O-1','goods_code':'SKU-1','sub_order_no':'SO-1',
          'order_item_evidence':evidence,'quantity':'7','original_amount':'69.30',
          'extra_fee_amount':'6.00','extra_fee_source_rows':[4,5],'amount':'75.30',
-         'item_name':'开票商品甲','tax_classification_code':'101','specification':'规格甲','unit':'件',
+         'item_name':'开票商品甲','tax_classification_code':'101','specification':'开票规格甲','unit':'件',
          'tax_rate':'0.13','discount_amount':'-4.00','discount_source_row':3},
     ]}]}
     return source,plan
@@ -320,6 +321,96 @@ def assert_source_verification_rejects(source,plan,expected):
     except (ValueError,KeyError) as exc:
         assert expected in str(exc),(expected,str(exc))
     else:raise AssertionError('Invalid source mapping accepted')
+
+
+def invoice_specification_cases():
+    return [
+        ({'invoice_spec':'  实际开票规格  ','开票规格':'不应覆盖原始字段'},'实际开票规格'),
+        ({'invoice_spec':'','开票规格':'不能覆盖空字符串'},''),
+        ({'invoice_spec':None,'开票规格':'不能覆盖None'},''),
+        ({'invoice_spec':' \t ','开票规格':'不能覆盖空白'},''),
+        ({},''),
+        ({'开票规格':'  中文开票规格  '},'中文开票规格'),
+        ({'开票规格':None},''),
+    ]
+
+
+def specification_source_fixture(fields):
+    source,plan=fee_verification_fixture()
+    goods=source['jst_invoice_goods'][0]
+    goods.pop('invoice_spec')
+    goods.update({'颜色及规格':'中文颜色规格','specification':'过时规范值','规格型号':'过时规格型号'})
+    goods.update(fields)
+    return source,plan
+
+
+def test_specification_verifier_uses_invoice_spec_and_preserves_explicit_blanks():
+    for fields,expected in invoice_specification_cases():
+        source,plan=specification_source_fixture(fields)
+        plan['invoices'][0]['detail_lines'][0]['specification']=expected or None
+        original=deepcopy(source)
+        assert verify_sources(source,plan)==plan['invoices']
+        for legacy in ('properties_value','颜色及规格','specification','规格型号'):
+            forged=deepcopy(plan)
+            forged['invoices'][0]['detail_lines'][0]['specification']=source['jst_invoice_goods'][0][legacy]
+            assert_source_verification_rejects(source,forged,'票聚字段来源不一致')
+        assert source==original
+
+
+def test_specification_verifier_independently_rejects_a_planner_color_spec_regression():
+    source,plan=fee_verification_fixture()
+    plan['invoices'][0]['detail_lines'][0]['specification']=source['jst_invoice_goods'][0]['properties_value']
+    original_value=rules.value
+    # A planner regression must not also change the independently read raw field.
+    def wrong_planner_value(row,field):
+        return row.get('properties_value') if field=='specification' else original_value(row,field)
+    with patch.object(rules,'value',side_effect=wrong_planner_value):
+        assert_source_verification_rejects(source,plan,'票聚字段来源不一致')
+
+
+def test_final_template_specification_cells_use_invoice_spec_without_color_fallback():
+    """Exercise the planner and actual bundled template's specification cells."""
+    schema=inspect_template(DEFAULT_TEMPLATE)
+    by_path={meta['path']:name for name,meta in schema.items()}
+    with tempfile.TemporaryDirectory() as folder:
+        root=Path(folder)
+        for index,(fields,specification) in enumerate(invoice_specification_cases()):
+            source,_=specification_source_fixture(fields)
+            source['template_rows'][0].update({'发票类型':'全电普通发票','抬头类型':'个人'})
+            source['run']={'mode':'preview','store_name':'test'}
+            original_source=deepcopy(source)
+            build=rules.InvoiceBuild('A-1',[(row['__source_row'],row) for row in source['template_rows']])
+            invoice=rules.build_invoice(build,{'O-1':{'SKU-1'}},rules.make_jst_index(source['jst_invoice_goods']),
+                                        source['run'],rules.make_order_items_index(source['order_items']))
+            assert not invoice['errors'],invoice['errors']
+            plan={'invoices':[invoice],'selected_application_ids':['A-1'],'fatal':False,'errors':[]}
+            assert verify_sources(source,plan)==[invoice]
+            expected=make_output_rows(plan)
+            assert expected[SHEETS[1]][0]['规格型号']==specification
+            authored=root/f'authored-{index}.xlsx';output=root/f'final-{index}.xlsx'
+            with ZipFile(DEFAULT_TEMPLATE) as original,ZipFile(authored,'w',ZIP_DEFLATED) as written:
+                for entry in original.infolist():
+                    raw=original.read(entry.filename)
+                    if entry.filename in by_path:
+                        name=by_path[entry.filename];meta=schema[name]
+                        xml=ET.fromstring(raw);data=xml.find(Q('sheetData'))
+                        for rn,values in enumerate(expected[name],meta['header_row']+1):
+                            row=ET.SubElement(data,Q('row'),r=str(rn))
+                            for label,value in values.items():
+                                if value=='':
+                                    continue
+                                cell=ET.SubElement(row,Q('c'),r=meta['columns'][label]+str(rn),t='inlineStr')
+                                ET.SubElement(ET.SubElement(cell,Q('is')),Q('t')).text=str(value)
+                        raw=ET.tostring(xml)
+                    written.writestr(entry,raw)
+            finalize(DEFAULT_TEMPLATE,authored,output,schema)
+            verify_workbook(DEFAULT_TEMPLATE,output,schema,expected)
+            detail=schema[SHEETS[1]]
+            actual=[row.get(detail['columns']['规格型号'],'')
+                    for rn,row in read_rows(output,SHEETS[1]) if rn>detail['header_row']]
+            assert actual==[specification],(fields,actual)
+            assert source==original_source
+
 
 def red_verification_fixture():
     source,plan=fee_verification_fixture()

@@ -10,26 +10,52 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import os
 import re
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from invoice_browser_config import with_invoice_pages
 from playwright_controller import (
     BrowserControllerError,
     PlaywrightBrowserController,
     load_browser_config,
+    PageRegistration,
+    VERIFICATION_URL_RE,
+    _same_role_page,
+    _url_is_login,
 )
 
 
 GOODS_FRAME_URL = "https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index"
 ORDER_NAVIGATION_DELAY_SECONDS = 10.0
 VERIFICATION_POLL_SECONDS = 0.5
+RECOVERABLE_READS = {"context", "applications", "export", "orders", "detail", "approval-status"}
+
+
+def _fetch_shop_cookies(shop_name: str, expected_account: str | None) -> dict[str, Any]:
+    """Load the shared private credential reader only after explicit expiry."""
+    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    path = root / "skills" / "_shared" / "qianniu_auth" / "feishu_cookie_recovery.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_invoice_feishu_cookie_recovery", path)
+        if spec is None or spec.loader is None:
+            raise ValueError("shared reader unavailable")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module.fetch_shop_cookies(shop_name=shop_name, expected_account=expected_account)
+    except Exception:
+        # Even import/browser errors must never expose cookies or credentials.
+        raise PlaywrightAdapterError("千牛 Cookie 恢复资料不可用，请更新飞书资料后恢复原任务",
+                                     "auth_required", site="qianniu") from None
 
 
 class PlaywrightAdapterError(RuntimeError):
@@ -96,6 +122,7 @@ class PlaywrightAdapterRunner:
                  profile_directory: str | None = None,
                  timeout_ms: int = 30_000,
                  launch_if_needed: bool = True,
+                 recovery_identity: dict[str, Any] | None = None,
                  progress: Callable[[str], None] | None = None) -> None:
         try:
             self.config, self.config_path = load_browser_config(config_path, profile_directory=profile_directory)
@@ -130,6 +157,9 @@ class PlaywrightAdapterRunner:
         self.timeout_ms = timeout_ms
         self.launch_if_needed = bool(launch_if_needed)
         self.progress = progress or (lambda _message: None)
+        self.recovery_identity = dict(recovery_identity or {})
+        self._cookie_recovery_attempted = False
+        self._verified_contexts: dict[str, dict[str, Any]] = {}
         self.skill_dir = Path(__file__).resolve().parent
         self.loop: asyncio.AbstractEventLoop | None = None
         self.controller: PlaywrightBrowserController | None = None
@@ -166,14 +196,19 @@ class PlaywrightAdapterRunner:
                 self.controllers[site] = controller
                 if site == "qianniu":
                     self.controller = controller
+                    if self.recovery_identity.get("expected_store"):
+                        controller.login_recovery = self._recover_startup_login
                 # start() validates ownership and reuses a correct running
                 # environment itself. Never retry a failed connect by blindly
                 # starting another browser or bypassing a login/profile error.
                 open_browser = controller.start if self.launch_if_needed else controller.connect
                 await asyncio.wait_for(
                     open_browser(open_missing=True), timeout=max(0.001, self.timeout_ms / 1000)
+                    + (120 if site == "qianniu" and self.recovery_identity.get("expected_store") else 0)
                 )
             except asyncio.CancelledError:
+                raise
+            except PlaywrightAdapterError:
                 raise
             except Exception as exc:
                 code = exc.code if isinstance(exc, BrowserControllerError) else "browser_launch_failed"
@@ -265,6 +300,10 @@ class PlaywrightAdapterRunner:
             async def serve() -> None:
                 self._stop_event = asyncio.Event()
                 self._startup_task = loop.create_task(self._boot())
+                # close() can race construction before the worker has a loop
+                # or startup task to cancel. Honour that request before boot.
+                if self._shutdown_requested.is_set():
+                    self._startup_task.cancel()
                 try:
                     await self._startup_task
                 except BaseException as exc:  # publish to caller, never hang ready
@@ -286,13 +325,20 @@ class PlaywrightAdapterRunner:
         self.thread = threading.Thread(target=worker, name="qianniu-playwright", daemon=True)
         self.thread.start()
         browser_count = 2 if self.jst_config is not None else 1
-        if not self.ready.wait(timeout=max(10, browser_count * self.timeout_ms / 1000 + 10)):
-            site = self._starting_site
+        startup_recovery_budget = 120 if self.recovery_identity.get("expected_store") else 0
+        try:
+            if not self.ready.wait(timeout=max(10, browser_count * self.timeout_ms / 1000 + 10)
+                                   + startup_recovery_budget):
+                raise PlaywrightAdapterError("Playwright controller 启动超时", "browser_launch_failed",
+                                             site=self._starting_site)
+            if self.start_error is not None:
+                self.thread.join(timeout=30)
+                self._raise_controller_error(self.start_error, site=self._starting_site)
+        except BaseException:
+            # A constructor interrupted before returning has no caller-owned
+            # adapter to close. Stop its startup recovery and join cleanup here.
             self.close()
-            raise PlaywrightAdapterError("Playwright controller 启动超时", "browser_launch_failed", site=site)
-        if self.start_error is not None:
-            self.thread.join(timeout=30)
-            self._raise_controller_error(self.start_error, site=self._starting_site)
+            raise
 
     def _raise_controller_error(self, error: BaseException, *, site: str | None = None) -> None:
         if isinstance(error, PlaywrightAdapterError):
@@ -348,6 +394,7 @@ class PlaywrightAdapterRunner:
         pages = await self._pages_receipt()
         value["browser_pages"] = {"invoice": pages.get("invoice"),
                                    "orders": pages.get("orders")}
+        self._remember_context("qianniu", value)
         return value
 
     async def _context_jst(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -372,11 +419,112 @@ class PlaywrightAdapterRunner:
             frame_url=GOODS_FRAME_URL,
         )
         pages = await self._pages_receipt()
-        return {"isLogin": True, "is_login": True, "issuer": issuer,
+        value = {"isLogin": True, "is_login": True, "issuer": issuer,
                 "issuer_label": str(label), "coid": str(frame_value["coid"]),
                 "uid": str(frame_value["uid"]), "jst_url": str(page.url),
                 "checked_at": frame_value.get("checked_at") or _now(),
                 "browser_pages": {"goods": pages.get("goods")}}
+        self._remember_context("jst", value)
+        return value
+
+    def _remember_context(self, site: str, value: dict[str, Any]) -> None:
+        if not hasattr(self, "_verified_contexts"):
+            self._verified_contexts = {}
+        self._verified_contexts[site] = dict(value)
+
+    async def _recover_startup_login(self, controller: Any, error: Any) -> None:
+        await self._restore_cookie_session(controller, self.recovery_identity)
+        # The ordinary context stage still checks both sites before any work.
+
+    async def _restore_cookie_session(self, controller: Any, payload: dict[str, Any]) -> None:
+        if getattr(self, "_cookie_recovery_attempted", False):
+            raise PlaywrightAdapterError("千牛登录恢复已尝试一次，请人工处理后恢复原任务",
+                                         "auth_required", site="qianniu")
+        identity = {**getattr(self, "recovery_identity", {}), **payload}
+        store = identity.get("expected_store")
+        if not isinstance(store, str) or not store.strip():
+            raise PlaywrightAdapterError("千牛登录恢复缺少精确店铺名", "auth_required", site="qianniu")
+        context, profile_lock = controller.context, controller._profile_lock
+
+        def still_owned() -> None:
+            if getattr(self, "_closed", False) or context is None or controller.context is not context:
+                raise PlaywrightAdapterError("千牛恢复期间浏览器连接已变化", "browser_disconnected", site="qianniu")
+            if (profile_lock is None or controller._profile_lock is not profile_lock
+                    or profile_lock.owned is not True):
+                raise PlaywrightAdapterError("千牛恢复期间已失去原浏览器锁", "profile_locked", site="qianniu")
+
+        still_owned()
+        self._cookie_recovery_attempted = True
+        pages = [page for page in context.pages if not page.is_closed()
+                 and (urlsplit(str(page.url)).hostname or "").endswith(".taobao.com")]
+        if not pages or any(item.page.is_closed() for role, item in controller.registrations.items()
+                            if role in {"invoice", "orders"}):
+            raise PlaywrightAdapterError("千牛原业务页面已丢失", "page_missing", site="qianniu")
+        probe = (self.skill_dir / "playwright_page_probe.js").read_text(encoding="utf-8")
+        # Inspect the login page directly: the ordinary readiness gate stops
+        # at its URL before it can see a simultaneous slider challenge.
+        for page in pages:
+            if VERIFICATION_URL_RE.search(str(page.url)):
+                raise PlaywrightAdapterError("千牛页面需要人工验证", "verification_required", site="qianniu")
+            for frame in page.frames:
+                if frame is page.main_frame or not VERIFICATION_URL_RE.search(str(frame.url)):
+                    continue
+                if await (await frame.frame_element()).is_visible():
+                    raise PlaywrightAdapterError("千牛页面需要人工验证", "verification_required", site="qianniu")
+            evidence = await page.evaluate(probe, {})
+            if not isinstance(evidence, dict):
+                raise PlaywrightAdapterError("千牛登录页验证状态未确认", "page_not_ready", site="qianniu")
+            if evidence.get("verification"):
+                raise PlaywrightAdapterError("千牛页面需要人工验证", "verification_required", site="qianniu")
+        material = await asyncio.to_thread(_fetch_shop_cookies, store,
+            identity.get("expected_account") or identity.get("expected_account_nick")
+            or getattr(self, "_verified_contexts", {}).get("qianniu", {}).get("account_nick"))
+        still_owned()
+        try:
+            await context.add_cookies(material["cookies"])
+        except Exception:
+            raise PlaywrightAdapterError("千牛 Cookie 写入失败，请人工处理后恢复原任务",
+                                         "auth_required", site="qianniu") from None
+        finally:
+            material = None
+        used: set[int] = set()
+        for role in ("invoice", "orders"):
+            still_owned()
+            spec = controller.specs[role]
+            registered = controller.registrations.get(role)
+            page = registered.page if registered and not registered.page.is_closed() else None
+            if page is None:
+                page = next((item for item in pages if id(item) not in used
+                             and _same_role_page(str(item.url), spec.url)), None)
+            if page is None:
+                page = next((item for item in pages if id(item) not in used
+                             and _url_is_login(str(item.url))), None)
+            if page is None:
+                page = await context.new_page()
+            used.add(id(page))
+            controller.registrations[role] = PageRegistration(role, page)
+            await page.goto(spec.url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            await controller.wait_for_business_ready(role)
+        await controller.register_roles(open_missing=False)
+        self.progress("千牛登录 Cookie 已更新，正在重新核验原店铺及两站主体")
+
+    async def _reverify_after_recovery(self, payload: dict[str, Any]) -> None:
+        saved = {site: dict(value) for site, value in getattr(self, "_verified_contexts", {}).items()}
+        identity = {**getattr(self, "recovery_identity", {}), **payload, "prepare_orders": True}
+        previous = saved.get("qianniu", {})
+        for field, target in (("agentId", "agent_id"), ("observed_store", "expected_observed_store"),
+                              ("account_nick", "expected_account_nick")):
+            if previous.get(field) is not None:
+                identity[target] = previous[field]
+        # Recheck issuer/coid/uid without injecting cookies or navigating JST.
+        current = {"qianniu": await self._invoke_once("qianniu", "context", identity, False),
+                   "jst": await self._invoke_once("jst", "context", identity, False)}
+        for site, names in (("qianniu", ("store", "agentId", "observed_store", "account_nick")),
+                            ("jst", ("issuer", "coid", "uid"))):
+            for name in names:
+                if name in saved.get(site, {}) and str(saved[site][name]) != str(current[site].get(name)):
+                    self._verified_contexts = saved
+                    raise PlaywrightAdapterError("登录恢复后原主体发生变化", "context_changed", site=site)
 
     @staticmethod
     def _validate_orders_request(payload: dict[str, Any]) -> list[str]:
@@ -439,6 +587,36 @@ class PlaywrightAdapterRunner:
         task = asyncio.current_task()
         if task is not None:
             self._operation_tasks.add(task)
+        try:
+            return await self._invoke_with_recovery(site, operation, payload, binary)
+        finally:
+            if task is not None:
+                self._operation_tasks.discard(task)
+
+    async def _invoke_with_recovery(self, site: str, operation: str, payload: dict[str, Any],
+                                    binary: bool) -> Any:
+        try:
+            return await self._invoke_once(site, operation, payload, binary)
+        except PlaywrightAdapterError as exc:
+            identity = {**getattr(self, "recovery_identity", {}), **payload}
+            if (site != "qianniu" or operation not in RECOVERABLE_READS
+                    or exc.code not in {"login_required", "auth_required"}
+                    or not identity.get("expected_store")
+                    or getattr(self, "_cookie_recovery_attempted", False)):
+                raise
+            saved = {key: dict(value) for key, value in getattr(self, "_verified_contexts", {}).items()}
+            try:
+                await self._restore_cookie_session(self._controller_for(site), identity)
+                await self._reverify_after_recovery(identity)
+            except BaseException:
+                self._verified_contexts = saved
+                raise
+            # Only this failed read is repeated; approve and unknown writes
+            # never enter this branch. Existing durable checkpoints are intact.
+            return await self._invoke_once(site, operation, payload, binary)
+
+    async def _invoke_once(self, site: str, operation: str, payload: dict[str, Any],
+                           binary: bool) -> Any:
         operation_task = None
         controller = None
         role = "goods" if site == "jst" else ("orders" if operation in {"orders", "detail"} else "invoice")
@@ -481,8 +659,6 @@ class PlaywrightAdapterRunner:
                     self._cleanup_tasks.discard(cleanup_task)
                 if operation_task is not None:
                     self._operation_targets.pop(operation_task, None)
-                if task is not None:
-                    self._operation_tasks.discard(task)
 
     async def _approval(self, operation: str, payload: dict[str, Any], binary: bool) -> dict[str, Any]:
         """Pin the captured identity before any approval read or write."""
@@ -605,7 +781,9 @@ class PlaywrightAdapterRunner:
                    "orders": 600, "detail": 180, "approval-status": 900,
                    "approve": 150}.get(operation) if site == "qianniu" else 120)
         value = self._call(self._invoke_async(site, operation, payload, binary),
-                           site=site, timeout_seconds=budget)
+                           site=site, timeout_seconds=(budget or 0) + (240 if site == "qianniu"
+                               and operation in RECOVERABLE_READS
+                               and getattr(self, "recovery_identity", {}).get("expected_store") else 0))
         if binary and isinstance(value, (bytes, bytearray)):
             value = base64.b64encode(bytes(value)).decode("ascii")
         return {"operation": operation, "payload": value, "outputPath": str(output_path),

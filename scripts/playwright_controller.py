@@ -547,6 +547,10 @@ class PlaywrightBrowserController:
         self._runtime_path: Path | None = None
         self._runtime_owned = False
         self._cdp_port: int | None = None
+        # Business adapters may recover an explicitly expired Qianniu session
+        # while this same verified context and its profile lock are still held.
+        # Diagnostic commands leave this callback unset.
+        self.login_recovery: Any = None
 
     @classmethod
     def from_config_path(cls, config_path: str | os.PathLike[str], **kwargs: Any) -> "PlaywrightBrowserController":
@@ -760,13 +764,26 @@ class PlaywrightBrowserController:
             self.context.set_default_timeout(self.timeout_ms)
         except Exception:
             pass
+        return await self._register_with_login_recovery(launched=launched, open_missing=open_missing)
+
+    async def _register_with_login_recovery(self, *, launched: bool, open_missing: bool) -> dict[str, Any]:
         try:
             if launched:
                 # The native command already opened all role URLs. Wait for
                 # their delayed targets/redirects; never create duplicates.
                 return await self._wait_for_startup_roles()
             return await self.register_roles(open_missing=open_missing)
-        except Exception:
+        except Exception as exc:
+            try:
+                if (isinstance(exc, BrowserControllerError)
+                        and exc.code in {"login_required", "auth_required"}
+                        and exc.details.get("role") in {"invoice", "orders"}
+                        and self.login_recovery is not None):
+                    await self.login_recovery(self, exc)
+                    return await self.register_roles(open_missing=open_missing)
+            except BaseException:
+                await self.close()
+                raise
             await self.close()
             raise
 
